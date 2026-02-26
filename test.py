@@ -216,11 +216,13 @@ class WorkloadGenerator:
         "even", "new", "want", "because", "any", "these", "give", "day", "most", "us"
     ]
     
-    def __init__(self, trace_file: str, api_base: str, api_key: str = "EMPTY", model: str = "qwen"):
+    def __init__(self, trace_file: str, api_base: str, api_key: str = "EMPTY", model: str = "qwen", *, enable_prefetch: bool = False, prefetch_lead_time: float = 0.0):
         self.trace_file = trace_file
         self.api_base = api_base
         self.api_key = api_key
         self.model = model
+        self.enable_prefetch = enable_prefetch
+        self.prefetch_lead_time = max(prefetch_lead_time, 0.0)
         
         # 读取trace数据
         self.records = []
@@ -525,6 +527,45 @@ class WorkloadGenerator:
         
         return metrics, response_text
     
+    async def _send_prefetch(self,
+                             messages: List[Dict[str, str]],
+                             chat_id: int,
+                             turn: int) -> None:
+        """
+        发送一次prefetch请求，用于提前构建KV cache。
+        不计入性能统计，仅输出日志。
+        """
+        request_id = f"{chat_id}_turn{turn}_prefetch"
+        prompt_text = "\n".join([f"{m['role']}: {m['content']}" for m in messages])
+        prompt_tokens = self._count_tokens(prompt_text)
+        
+        print(f"[Prefetch发送] {request_id} | Input tokens: {prompt_tokens}, max_tokens: 1")
+        
+        start_time = time.time()
+        response_text = ""
+        success = False
+        try:
+            stream = await self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                max_tokens=1,
+                stream=True,
+            )
+            async for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    response_text += chunk.choices[0].delta.content
+            success = True
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Prefetch失败] {request_id}: {exc}")
+        
+        if response_text:
+            _ = self._count_tokens(response_text)
+        
+        total_time = time.time() - start_time
+        status = "✓" if success else "✗"
+        print(f"[Prefetch完成] {status} {request_id} | Total: {total_time*1000:.2f}ms | "
+              f"Input: {prompt_tokens} tokens")
+    
     async def _process_conversation(self, 
                                    conv_type: str, 
                                    chain: List[Dict],
@@ -540,12 +581,24 @@ class WorkloadGenerator:
         messages = []
         
         for i, record in enumerate(chain):
+            request_id = f"{record['chat_id']}_turn{record['turn']}"
             # 检查是否已超时（超时后不再发送新请求）
             if self._is_timeout():
-                request_id = f"{record['chat_id']}_turn{record['turn']}"
                 elapsed = time.time() - self.test_start_time if self.test_start_time else 0
                 print(f"[超时跳过] {request_id} | 已运行 {elapsed:.2f}s，超过 timeout {self.timeout}s，跳过剩余 {len(chain) - i} 个请求")
                 break
+            
+            # 如开启prefetch，提前预热KV cache（仅多轮且有历史上下文）
+            if self.enable_prefetch and conv_type == "multi" and messages:
+                prefetch_at = scheduled_timestamp - self.prefetch_lead_time
+                now = time.time()
+                if prefetch_at > now:
+                    await asyncio.sleep(prefetch_at - now)
+                if self._is_timeout():
+                    elapsed = time.time() - self.test_start_time if self.test_start_time else 0
+                    print(f"[超时跳过] {request_id} | 已运行 {elapsed:.2f}s，超过 timeout {self.timeout}s，跳过剩余 {len(chain) - i} 个请求")
+                    break
+                await self._send_prefetch(messages.copy(), record['chat_id'], record['turn'])
             
             # 等待到该轮次的预定发送时间
             current_time = time.time()
@@ -798,6 +851,10 @@ async def main():
                        help='Output JSON file for detailed results')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed for reproducibility')
+    parser.add_argument('--enable-prefetch', action='store_true',
+                       help='Enable prefix KV cache prefetch for multi-turn conversations')
+    parser.add_argument('--prefetch-lead-time', type=float, default=0.0,
+                       help='Seconds ahead of scheduled send to issue prefetch')
     
     args = parser.parse_args()
 
@@ -810,7 +867,9 @@ async def main():
         trace_file=args.trace_file,
         api_base=args.api_base,
         api_key=args.api_key,
-        model=args.model
+        model=args.model,
+        enable_prefetch=args.enable_prefetch,
+        prefetch_lead_time=args.prefetch_lead_time
     )
     
     # 采样workload

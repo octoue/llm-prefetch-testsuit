@@ -60,6 +60,7 @@ class RequestMetrics:
     timestamp: float  # 请求发送时间
     success: bool
     error_msg: Optional[str] = None
+    is_prefetch: bool = False  # 是否是prefetch请求
 
 @dataclass
 class WorkloadStats:
@@ -77,11 +78,29 @@ class WorkloadStats:
     single_turn_count: int = 0
     multi_turn_count: int = 0
     
+    # Prefetch 统计（不参与主要指标计算）
+    prefetch_total: int = 0
+    prefetch_successful: int = 0
+    prefetch_failed: int = 0
+    prefetch_ttft_list: List[float] = field(default_factory=list)
+    prefetch_total_time_list: List[float] = field(default_factory=list)
+    
     start_time: Optional[float] = None
     end_time: Optional[float] = None
     
     def add_metric(self, metric: RequestMetrics):
         """添加一个请求的指标"""
+        # Prefetch 请求单独统计，不参与主要指标计算
+        if metric.is_prefetch:
+            self.prefetch_total += 1
+            if metric.success:
+                self.prefetch_successful += 1
+                self.prefetch_ttft_list.append(metric.ttft)
+                self.prefetch_total_time_list.append(metric.total_time)
+            else:
+                self.prefetch_failed += 1
+            return  # 不参与主要指标统计
+        
         self.total_requests += 1
         if metric.success:
             self.successful_requests += 1
@@ -114,9 +133,20 @@ class WorkloadStats:
         print(f"  总请求数: {self.total_requests}")
         print(f"  成功请求: {self.successful_requests}")
         print(f"  失败请求: {self.failed_requests}")
-        print(f"  成功率: {self.successful_requests/self.total_requests*100:.2f}%")
+        print(f"  成功率: {self.successful_requests/self.total_requests*100:.2f}%" if self.total_requests > 0 else "  成功率: N/A")
         print(f"  单轮对话: {self.single_turn_count}")
         print(f"  多轮对话: {self.multi_turn_count}")
+        
+        # Prefetch 统计
+        if self.prefetch_total > 0:
+            print(f"\nPrefetch 请求统计 (不参与性能指标计算):")
+            print(f"  Prefetch 总数: {self.prefetch_total}")
+            print(f"  Prefetch 成功: {self.prefetch_successful}")
+            print(f"  Prefetch 失败: {self.prefetch_failed}")
+            print(f"  Prefetch 成功率: {self.prefetch_successful/self.prefetch_total*100:.2f}%")
+            if self.prefetch_ttft_list:
+                print(f"  Prefetch 平均TTFT: {np.mean(self.prefetch_ttft_list)*1000:.2f} ms")
+                print(f"  Prefetch 平均总时间: {np.mean(self.prefetch_total_time_list)*1000:.2f} ms")
         
         print(f"\nToken统计:")
         print(f"  总prompt tokens: {self.total_prompt_tokens}")
@@ -191,6 +221,14 @@ class WorkloadStats:
                 "p90_ms": np.percentile(self.tpot_list, 90)*1000 if self.tpot_list else 0,
                 "p95_ms": np.percentile(self.tpot_list, 95)*1000 if self.tpot_list else 0,
                 "p99_ms": np.percentile(self.tpot_list, 99)*1000 if self.tpot_list else 0,
+            },
+            "prefetch": {
+                "total": self.prefetch_total,
+                "successful": self.prefetch_successful,
+                "failed": self.prefetch_failed,
+                "success_rate": self.prefetch_successful/self.prefetch_total*100 if self.prefetch_total > 0 else 0,
+                "mean_ttft_ms": np.mean(self.prefetch_ttft_list)*1000 if self.prefetch_ttft_list else 0,
+                "mean_total_time_ms": np.mean(self.prefetch_total_time_list)*1000 if self.prefetch_total_time_list else 0,
             }
         }
         
@@ -216,11 +254,13 @@ class WorkloadGenerator:
         "even", "new", "want", "because", "any", "these", "give", "day", "most", "us"
     ]
     
-    def __init__(self, trace_file: str, api_base: str, api_key: str = "EMPTY", model: str = "qwen"):
+    def __init__(self, trace_file: str, api_base: str, api_key: str = "EMPTY", model: str = "qwen",
+                 prefetch_seconds: float = 0.0):
         self.trace_file = trace_file
         self.api_base = api_base
         self.api_key = api_key
         self.model = model
+        self.prefetch_seconds = prefetch_seconds  # Prefetch 提前量（秒），0表示禁用
         
         # 读取trace数据
         self.records = []
@@ -251,6 +291,9 @@ class WorkloadGenerator:
         # Timeout 相关配置
         self.timeout: Optional[float] = None  # 超时时间（秒）
         self.test_start_time: Optional[float] = None  # 测试开始时间
+        
+        if self.prefetch_seconds > 0:
+            print(f"[Prefetch] 已启用，提前量: {self.prefetch_seconds} 秒")
     
     def _is_timeout(self) -> bool:
         """检查是否已经超时"""
@@ -426,13 +469,9 @@ class WorkloadGenerator:
                            chat_id: int,
                            turn: int,
                            is_single_turn: bool,
-                           target_output_tokens: int,
-                           scheduled_time: Optional[float] = None) -> Tuple[RequestMetrics, str]:
+                           target_output_tokens: int) -> Tuple[RequestMetrics, str]:
         """
         发送单个请求并测量性能指标
-        
-        Args:
-            scheduled_time: 预计的发送时间（相对于测试开始时间），用于日志对比
         
         Returns:
             (RequestMetrics, response_text): 返回指标和LLM的完整响应文本
@@ -443,21 +482,10 @@ class WorkloadGenerator:
         prompt_text = "\n".join([f"{m['role']}: {m['content']}" for m in messages])
         prompt_tokens = self._count_tokens(prompt_text)
         
-        # 记录实际发送时间
-        start_time = time.time()
-        actual_send_time = start_time - self.test_start_time if self.test_start_time else 0
+        # 日志：发送请求
+        print(f"[发送请求] {request_id} | Input tokens: {prompt_tokens}, Target output tokens: {target_output_tokens}")
         
-        # 日志：发送请求（包含预计时间和实际时间的对比）
-        if scheduled_time is not None:
-            time_diff = (actual_send_time - scheduled_time) * 1000  # 转换为毫秒
-            print(f"[发送] {request_id} | "
-                  f"预计: {scheduled_time:.3f}s, 实际: {actual_send_time:.3f}s, "
-                  f"偏差: {time_diff:+.2f}ms | "
-                  f"Input: {prompt_tokens}tok, Target output: {target_output_tokens}tok")
-        else:
-            print(f"[发送] {request_id} | "
-                  f"实际: {actual_send_time:.3f}s | "
-                  f"Input: {prompt_tokens}tok, Target output: {target_output_tokens}tok")
+        start_time = time.time()
         first_token_time = None
         completion_tokens = 0
         success = False
@@ -525,6 +553,96 @@ class WorkloadGenerator:
         
         return metrics, response_text
     
+    async def _send_prefetch_request(self, 
+                                     messages: List[Dict[str, str]], 
+                                     chat_id: int,
+                                     turn: int) -> RequestMetrics:
+        """
+        发送 prefetch 请求（用于预热 KV cache）
+        
+        Prefetch 请求特点：
+        - max_tokens=1，只触发 prefill，生成尽量少的 token
+        - 不参与 TTFT/TPOT 统计
+        - 用于提前将 KV cache 从 CPU 加载到 GPU
+        
+        Returns:
+            RequestMetrics: prefetch 请求的指标（is_prefetch=True）
+        """
+        request_id = f"{chat_id}_turn{turn}_prefetch"
+        
+        # 计算 prompt tokens
+        prompt_text = "\n".join([f"{m['role']}: {m['content']}" for m in messages])
+        prompt_tokens = self._count_tokens(prompt_text)
+        
+        # 日志：发送 prefetch 请求
+        print(f"[Prefetch发送] {request_id} | Input tokens: {prompt_tokens}, max_tokens: 1")
+        
+        start_time = time.time()
+        first_token_time = None
+        completion_tokens = 0
+        success = False
+        error_msg = None
+        response_text = ""
+        
+        try:
+            stream = await self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                max_tokens=1,  # 只生成1个token，主要是触发prefill
+                stream=True,
+            )
+            
+            async for chunk in stream:
+                if chunk.choices and len(chunk.choices) > 0:
+                    if chunk.choices[0].delta.content:
+                        if first_token_time is None:
+                            first_token_time = time.time()
+                        content = chunk.choices[0].delta.content
+                        response_text += content
+            
+            # 计算实际生成的 token 数量
+            if response_text:
+                completion_tokens = self._count_tokens(response_text)
+            
+            success = True
+            
+        except Exception as e:
+            error_msg = str(e)
+            print(f"[Prefetch失败] {request_id}: {error_msg}")
+        
+        end_time = time.time()
+        total_time = end_time - start_time
+        
+        # 计算 TTFT
+        if first_token_time and success:
+            ttft = first_token_time - start_time
+        else:
+            ttft = 0
+        
+        metrics = RequestMetrics(
+            request_id=request_id,
+            chat_id=chat_id,
+            turn=turn,
+            is_single_turn=False,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            ttft=ttft,
+            tpot=0,  # Prefetch 不计算 TPOT
+            total_time=total_time,
+            timestamp=start_time,
+            success=success,
+            error_msg=error_msg,
+            is_prefetch=True  # 标记为 prefetch 请求
+        )
+        
+        # 打印完成日志
+        status = "✓" if success else "✗"
+        print(f"[Prefetch完成] {status} {request_id} | "
+              f"TTFT: {ttft*1000:.2f}ms, Total: {total_time*1000:.2f}ms | "
+              f"Input: {prompt_tokens} tokens")
+        
+        return metrics
+    
     async def _process_conversation(self, 
                                    conv_type: str, 
                                    chain: List[Dict],
@@ -538,6 +656,7 @@ class WorkloadGenerator:
             scheduled_timestamp: 这个对话的调度时间戳
         """
         messages = []
+        prefetch_tasks = []  # 跟踪 prefetch 任务
         
         for i, record in enumerate(chain):
             # 检查是否已超时（超时后不再发送新请求）
@@ -547,12 +666,44 @@ class WorkloadGenerator:
                 print(f"[超时跳过] {request_id} | 已运行 {elapsed:.2f}s，超过 timeout {self.timeout}s，跳过剩余 {len(chain) - i} 个请求")
                 break
             
+            # 对于多轮对话的后续轮次（i > 0），提前发送 prefetch 请求
+            if i > 0 and self.prefetch_seconds > 0 and conv_type == "multi":
+                # 计算 prefetch 发送时间
+                prefetch_time = scheduled_timestamp - self.prefetch_seconds
+                current_time = time.time()
+                prefetch_wait_time = prefetch_time - current_time
+                
+                if prefetch_wait_time > 0:
+                    # 等待到 prefetch 时间
+                    request_id = f"{record['chat_id']}_turn{record['turn']}"
+                    print(f"[Prefetch等待] {request_id} | 等待 {prefetch_wait_time:.3f} 秒后发送 prefetch")
+                    await asyncio.sleep(prefetch_wait_time)
+                    
+                    # 等待后检查是否超时
+                    if self._is_timeout():
+                        elapsed = time.time() - self.test_start_time if self.test_start_time else 0
+                        print(f"[超时跳过] {request_id} | 已运行 {elapsed:.2f}s，超过 timeout {self.timeout}s，跳过剩余 {len(chain) - i} 个请求")
+                        break
+                
+                # 发送 prefetch 请求（使用当前已有的对话历史，不包含当前轮的新用户消息）
+                # Prefetch 请求不阻塞，使用 create_task
+                if messages:  # 只有在有历史消息时才发送 prefetch
+                    prefetch_task = asyncio.create_task(
+                        self._send_prefetch_request(
+                            messages=messages.copy(),
+                            chat_id=record['chat_id'],
+                            turn=record['turn']
+                        )
+                    )
+                    prefetch_tasks.append(prefetch_task)
+            
             # 等待到该轮次的预定发送时间
             current_time = time.time()
             wait_time = scheduled_timestamp - current_time
             
             if wait_time > 0:
                 request_id = f"{record['chat_id']}_turn{record['turn']}"
+                print(f"[等待] {request_id} | 等待 {wait_time:.3f} 秒后发送 (scheduled: {scheduled_timestamp:.3f}, current: {current_time:.3f})")
                 await asyncio.sleep(wait_time)
                 
                 # 等待后再次检查是否超时
@@ -579,17 +730,13 @@ class WorkloadGenerator:
             user_message = self._generate_text_with_tokens(new_user_tokens)
             messages.append({"role": "user", "content": user_message})
             
-            # 获取scheduled_time（相对于测试开始时间）
-            scheduled_relative_time = record.get('scheduled_timestamp', 0)
-            
             # 发送请求，并获取真实的LLM响应
             metric, response_text = await self._send_request(
                 messages=messages.copy(),
                 chat_id=record['chat_id'],
                 turn=record['turn'],
                 is_single_turn=(conv_type == "single"),
-                target_output_tokens=record['output_length'],
-                scheduled_time=scheduled_relative_time
+                target_output_tokens=record['output_length']
             )
             
             self.stats.add_metric(metric)
@@ -611,74 +758,79 @@ class WorkloadGenerator:
             
             # 如果是多轮对话，为下一轮更新scheduled_timestamp
             if i < len(chain) - 1:
-                # 下一轮的时间戳
+                # 下一轮的时间戳（已经过缩放）
                 next_record = chain[i + 1]
-                scheduled_timestamp = next_record.get('absolute_timestamp', scheduled_timestamp)
-    
-    def _schedule_requests(self, workload: List[Tuple[str, List[Dict]]], qps: float):
-        """
-        根据QPS为所有请求分配调度时间戳
+                scheduled_timestamp = next_record.get('scaled_timestamp', scheduled_timestamp)
         
-        预处理阶段:
-        1. 收集所有请求
-        2. 按原始时间戳排序
-        3. 根据QPS计算请求间隔 (interval = 1/qps)
-        4. 按顺序为每个请求分配时间戳: t[i] = i * interval
+        # 等待所有 prefetch 任务完成并收集统计
+        if prefetch_tasks:
+            prefetch_results = await asyncio.gather(*prefetch_tasks, return_exceptions=True)
+            for result in prefetch_results:
+                if isinstance(result, RequestMetrics):
+                    self.stats.add_metric(result)
+                elif isinstance(result, Exception):
+                    print(f"[Prefetch异常] {result}")
+    
+    def _scale_timestamps(self, workload: List[Tuple[str, List[Dict]]], qps: float):
+        """
+        按照QPS约束等比例缩放原始时间戳，确保第一个请求从时间0开始
         
         Args:
             workload: workload列表
-            qps: 目标QPS（请求级别）
+            qps: 目标QPS（请求级别，非对话级别）
         
         Returns:
-            处理后的workload，每个record增加scheduled_timestamp字段
+            缩放后的workload，每个record增加scaled_timestamp字段
         """
-        # 步骤1: 收集所有请求，记录它们在workload中的位置
-        all_requests_info = []
-        for conv_idx, (conv_type, chain) in enumerate(workload):
-            for req_idx, record in enumerate(chain):
-                all_requests_info.append({
-                    'conv_idx': conv_idx,
-                    'req_idx': req_idx,
-                    'original_timestamp': record['timestamp'],
-                    'record': record
-                })
+        # 收集所有请求及其原始时间戳
+        all_requests = []
+        for conv_type, chain in workload:
+            for record in chain:
+                all_requests.append(record)
         
-        if not all_requests_info:
+        if not all_requests:
             return workload
         
-        # 步骤2: 按原始时间戳排序
-        all_requests_info.sort(key=lambda x: x['original_timestamp'])
+        # 找出原始trace的时间范围
+        original_timestamps = [r['timestamp'] for r in all_requests]
+        min_timestamp = min(original_timestamps)
+        max_timestamp = max(original_timestamps)
+        original_duration = max_timestamp - min_timestamp
         
-        # 步骤3: 根据QPS计算请求间隔
-        total_requests = len(all_requests_info)
-        interval = 1.0 / qps  # 每个请求之间的间隔（秒）
+        # 计算目标持续时间
+        total_requests = len(all_requests)
+        target_duration = total_requests / qps
         
-        print(f"\n=== 请求调度预处理 ===")
+        # 计算缩放因子
+        if original_duration > 0:
+            scale_factor = target_duration / original_duration
+        else:
+            scale_factor = 1.0
+        
+        print(f"\n时间戳缩放信息:")
+        print(f"  原始时间范围: {original_duration:.2f} 秒 (从 {min_timestamp} 到 {max_timestamp})")
+        print(f"  目标持续时间: {target_duration:.2f} 秒 (从 0 开始)")
+        print(f"  缩放因子: {scale_factor:.4f}")
         print(f"  总请求数: {total_requests}")
         print(f"  目标QPS: {qps:.2f} req/s")
-        print(f"  请求间隔: {interval*1000:.2f} ms")
-        print(f"  预计总时长: {(total_requests - 1) * interval:.2f} 秒")
         
-        # 步骤4: 为每个请求分配时间戳（从0开始，按固定间隔）
-        for i, req_info in enumerate(all_requests_info):
-            scheduled_time = i * interval
-            req_info['scheduled_timestamp'] = scheduled_time
-        
-        # 将scheduled_timestamp写回原始的workload结构
-        scheduled_workload = []
+        # 为每个record添加缩放后的时间戳
+        scaled_workload = []
         for conv_type, chain in workload:
-            scheduled_chain = [record.copy() for record in chain]
-            scheduled_workload.append((conv_type, scheduled_chain))
+            scaled_chain = []
+            for record in chain:
+                # 创建record的副本
+                scaled_record = record.copy()
+                # 计算相对于最小时间戳的偏移
+                relative_time = record['timestamp'] - min_timestamp
+                # 应用缩放因子
+                scaled_relative_time = relative_time * scale_factor
+                # 保存缩放后的时间戳（从0开始）
+                scaled_record['scaled_timestamp'] = scaled_relative_time
+                scaled_chain.append(scaled_record)
+            scaled_workload.append((conv_type, scaled_chain))
         
-        # 更新scheduled_timestamp
-        for req_info in all_requests_info:
-            conv_idx = req_info['conv_idx']
-            req_idx = req_info['req_idx']
-            scheduled_time = req_info['scheduled_timestamp']
-            scheduled_workload[conv_idx][1][req_idx]['scheduled_timestamp'] = scheduled_time
-        
-        print(f"=== 调度完成 ===\n")
-        return scheduled_workload
+        return scaled_workload
     
     async def run_workload(self,
                           workload: List[Tuple[str, List[Dict]]],
@@ -707,8 +859,8 @@ class WorkloadGenerator:
         # 设置 timeout
         self.timeout = timeout
         
-        # 调度请求：根据QPS为每个请求分配时间戳
-        scheduled_workload = self._schedule_requests(workload, qps)
+        # 缩放时间戳
+        scaled_workload = self._scale_timestamps(workload, qps)
         
         self.stats.start_time = time.time()
         self.test_start_time = self.stats.start_time  # 同时设置实例变量用于超时检查
@@ -721,26 +873,26 @@ class WorkloadGenerator:
         
         # 为每个对话创建任务
         conversation_idx = 0
-        for conv_type, chain in scheduled_workload:
+        for conv_type, chain in scaled_workload:
             if not chain:
                 continue
             
-            # 使用第一个请求的scheduled_timestamp作为对话开始时间
-            first_request_timestamp = test_start_time + chain[0]['scheduled_timestamp']
+            # 使用第一个请求的缩放时间戳作为对话开始时间
+            first_request_timestamp = test_start_time + chain[0]['scaled_timestamp']
             
             # 如果设置了duration，检查是否超时
             if duration:
-                if chain[0]['scheduled_timestamp'] >= duration:
+                if chain[0]['scaled_timestamp'] >= duration:
                     continue
             
             # 为chain中的每个请求更新绝对时间戳
             for record in chain:
-                record['absolute_timestamp'] = test_start_time + record['scheduled_timestamp']
+                record['scaled_timestamp'] = test_start_time + record['scaled_timestamp']
             
             # 日志：调度对话
             conversation_idx += 1
             print(f"[调度对话 #{conversation_idx}] chat_id: {chain[0]['chat_id']}, "
-                  f"轮数: {len(chain)}, 第一个请求时间: {chain[0]['scheduled_timestamp']:.3f}s")
+                  f"轮数: {len(chain)}, 第一个请求时间: {chain[0]['scaled_timestamp'] - test_start_time:.3f}s")
             
             # 创建对话处理任务
             task = asyncio.create_task(
@@ -793,6 +945,12 @@ async def main():
                        help='Test timeout in seconds. After timeout, no new requests will be sent, '
                             'but ongoing requests will be completed. (None = no timeout)')
     
+    # Prefetch 配置
+    parser.add_argument('--prefetch-seconds', type=float, default=0.0,
+                       help='Prefetch lead time in seconds (0 = disabled). '
+                            'For multi-turn conversations, a prefetch request will be sent '
+                            'this many seconds before the actual request to pre-warm the KV cache.')
+    
     # 输出配置
     parser.add_argument('--output', type=str, default=None,
                        help='Output JSON file for detailed results')
@@ -810,7 +968,8 @@ async def main():
         trace_file=args.trace_file,
         api_base=args.api_base,
         api_key=args.api_key,
-        model=args.model
+        model=args.model,
+        prefetch_seconds=args.prefetch_seconds
     )
     
     # 采样workload

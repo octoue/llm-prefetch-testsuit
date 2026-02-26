@@ -256,5 +256,5 @@ def analyze_conversation_trace(file_path: str):
         print(f"  最大轮数: {np.max(turn_counts)}")
 
 if __name__ == "__main__":
-    file_path = "./qwen_traceB_blksz_16.jsonl"
+    file_path = "./qwen_traceA_blksz_16.jsonl"
     analyze_conversation_trace(file_path)
