@@ -1,9 +1,17 @@
 #!/bin/bash
 
+# 加载配置（模型路径、日志路径等）
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[ -f "$SCRIPT_DIR/prefetch_config.sh" ] && source "$SCRIPT_DIR/prefetch_config.sh"
+
 # 定义要测试的 QPS 数组
 QPS_LIST=(0.8 0.6 0.4 0.2 1.0)
 TRACE_FILE="qwen_traceA_blksz_16.jsonl"
-MODEL_PATH="Qwen/Qwen2.5-72B-Instruct"
+MODEL_PATH="${MODEL_PATH:-/lpai/models/Qwen__Qwen3-8B/25-07-26-0349}"
+VLLM_LOG="${VLLM_LOG:-./vllm_state.log}"
+
+# 确保 logs 目录存在
+mkdir -p logs
 
 for qps in "${QPS_LIST[@]}"
 do
@@ -24,7 +32,7 @@ do
         --model $MODEL_PATH \
         --output "results_qps${qps}_prefetch.json"  &> "./logs/prefetch_results_qps${qps}_prefetch.log"
 
-    grep "Avg prompt throughput" /workspace/vllm_offload_test/vllm_state.log >> "./logs/prefetch_results_qps${qps}_prefetch.log"
+    grep "Avg prompt throughput" "$VLLM_LOG" >> "./logs/prefetch_results_qps${qps}_prefetch.log" 2>/dev/null || true
 
     sleep 60
 
@@ -42,7 +50,7 @@ do
     echo "Done with QPS $qps"
     echo ""
 
-    grep "Avg prompt throughput" /workspace/vllm_offload_test/vllm_state.log >> "./logs/no_prefetch_results_qps${qps}.log"
+    grep "Avg prompt throughput" "$VLLM_LOG" >> "./logs/no_prefetch_results_qps${qps}.log" 2>/dev/null || true
 
     sleep 60
 done

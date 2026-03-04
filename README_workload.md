@@ -349,3 +349,41 @@ python workload_generator.py \
     --qps 5.0 \
     --output results_qwen14b.json
 ```
+
+## Prefetch 测试（本地模型）
+
+使用本地 Qwen3-8B 模型进行 prefetch 测试：
+
+### 1. 启动 vLLM（需 HF_HUB_OFFLINE=1）
+
+```bash
+# 使用 vllm 项目中的启动脚本（自动选择最空闲 GPU）
+cd /path/to/vllm
+./tests/start_vllm.sh
+```
+
+或手动启动：
+
+```bash
+HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 vllm serve \
+  --model /lpai/models/Qwen__Qwen3-8B/25-07-26-0349 \
+  --host 0.0.0.0 --port 8000 \
+  --enable-prefix-caching --enable-prompt-tokens-details
+```
+
+### 2. 运行 Prefetch 测试
+
+```bash
+# 快速测试
+./test.sh
+
+# 完整 QPS 对比测试（With/Without Prefetch）
+./full-test.sh
+```
+
+### 3. 配置
+
+可通过 `prefetch_config.sh` 或环境变量覆盖：
+
+- `MODEL_PATH`: 模型路径（默认 `/lpai/models/Qwen__Qwen3-8B/25-07-26-0349`）
+- `VLLM_LOG`: vLLM 日志路径（默认 `./vllm_state.log`）
