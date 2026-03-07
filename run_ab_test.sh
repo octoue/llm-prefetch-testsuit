@@ -5,7 +5,9 @@
 # 用法: ./run_ab_test.sh
 #   或: QPS=0.3 NUM_CONV=30 ./run_ab_test.sh
 #
-# 前提: vLLM server 已启动（如通过 vllm-launch-script/start_vllm_simple.sh 或 start_vllm_with_offload.sh）
+# 前提: vLLM server 已启动（使用本地模型、离线模式）:
+#   ./start_vllm.sh
+#   或 KV_OFFLOADING_SIZE=2 ./start_vllm.sh  # 启用 KV offload 以测试 prefetch
 #
 
 set -e
