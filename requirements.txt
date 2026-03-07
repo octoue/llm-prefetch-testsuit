@@ -1,0 +1,6 @@
+# Prefetch A/B 评估框架依赖
+openai>=1.0.0
+tiktoken
+numpy
+pandas
+plotly

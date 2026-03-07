@@ -61,6 +61,7 @@ async def measure_ttft(client: AsyncOpenAI, model: str, messages: list) -> tuple
         messages=messages,
         max_tokens=32,
         stream=True,
+        stream_options={"include_usage": True},
     )
     async for chunk in stream_obj:
         if first_token_time is None and chunk.choices and chunk.choices[0].delta.content:
