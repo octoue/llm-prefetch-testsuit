@@ -27,6 +27,7 @@ EXTRA_ARGS=()
 if [ -n "$KV_OFFLOADING_SIZE" ] && [ "$KV_OFFLOADING_SIZE" != "0" ]; then
   EXTRA_ARGS+=(--kv-offloading-size "$KV_OFFLOADING_SIZE")
   EXTRA_ARGS+=(--kv-offloading-backend "native")
+  EXTRA_ARGS+=(--disable-hybrid-kv-cache-manager)
   echo "KV Offloading enabled: ${KV_OFFLOADING_SIZE} GiB"
 fi
 
