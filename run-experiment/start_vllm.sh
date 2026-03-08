@@ -6,14 +6,20 @@
 
 set -e
 
-# 本地模型路径（不从 HuggingFace 下载）
-MODEL_PATH="${MODEL_PATH:-/lpai/models/Qwen__Qwen3-8B/25-07-26-0349}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 
-# GPU 配置（等比缩放自 H20-96GB + 14B 的旧 config.env）
+[ -f "$SCRIPT_DIR/config.env" ] && set -a && source "$SCRIPT_DIR/config.env" && set +a
+
+# 默认值（当 config.env 未定义时）
+MODEL_PATH="${MODEL_PATH:-/lpai/models/Qwen__Qwen3-8B/25-07-26-0349}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.5}"
 NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE:-115}"
 KV_OFFLOADING_SIZE="${KV_OFFLOADING_SIZE:-5}"
 SWAP_SPACE="${SWAP_SPACE:-256}"
+API_PORT="${API_PORT:-8000}"
+VLLM_LOG="${VLLM_LOG:-vllm_state.log}"
+[[ "$VLLM_LOG" != /* ]] && VLLM_LOG="$SCRIPT_DIR/$VLLM_LOG"
 
 # 自动选择显存最空闲的 1 张 GPU（8B 模型单卡即可）
 FREE_GPUS=$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2>/dev/null | \
@@ -32,7 +38,7 @@ echo "VLLM_SERVER_DEV_MODE=1 (enabled for /reset_prefix_cache)"
 CMD_ARGS=(
   --model "$MODEL_PATH"
   --host 0.0.0.0
-  --port 8000
+  --port "$API_PORT"
   --max-num-seqs 256
   --block-size 16
   --tensor-parallel-size 1
@@ -58,4 +64,4 @@ fi
 
 # VLLM_SERVER_DEV_MODE=1 启用 /reset_prefix_cache 等开发端点（用于 A/B 实验间清空 cache）
 # HF_HUB_OFFLINE=1 使用本地模型，不联网
-VLLM_SERVER_DEV_MODE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=$FREE_GPUS vllm serve "${CMD_ARGS[@]}" | tee vllm_state.log
+VLLM_SERVER_DEV_MODE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=$FREE_GPUS vllm serve "${CMD_ARGS[@]}" | tee "$VLLM_LOG"

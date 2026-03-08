@@ -3,4 +3,3 @@ openai>=1.0.0
 tiktoken
 numpy
 pandas
-plotly

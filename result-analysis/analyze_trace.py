@@ -1,5 +1,7 @@
+import argparse
 import json
 import numpy as np
+from pathlib import Path
 from collections import defaultdict
 from typing import Dict, List, Tuple
 
@@ -256,5 +258,10 @@ def analyze_conversation_trace(file_path: str):
         print(f"  最大轮数: {np.max(turn_counts)}")
 
 if __name__ == "__main__":
-    file_path = "./qwen_traceA_blksz_16.jsonl"
-    analyze_conversation_trace(file_path)
+    base_dir = Path(__file__).parent
+    default_trace = base_dir.parent / "data" / "qwen_traceA_blksz_16.jsonl"
+    parser = argparse.ArgumentParser(description="分析 trace 对话结构")
+    parser.add_argument("trace_file", nargs="?", default=str(default_trace),
+                        help=f"Trace JSONL 路径 (默认: {default_trace})")
+    args = parser.parse_args()
+    analyze_conversation_trace(args.trace_file)
