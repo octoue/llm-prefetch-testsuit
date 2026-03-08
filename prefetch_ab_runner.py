@@ -4,7 +4,7 @@ Prefetch A/B 实验 Runner
 
 基于真实 trace 运行 baseline 或 prefetch 模式，逐条落盘到 JSONL。
 - baseline: 不发 prefetch，直接发真实请求
-- prefetch: 先发 history 的 prefetch=True，等待 thinking time，再发真实请求
+- prefetch: 在 scheduled_time - lead_time 发送 history 的 prefetch，在 scheduled_time 发送真实请求
 
 用法:
   python prefetch_ab_runner.py --trace-file qwen_traceA_blksz_16.jsonl --mode baseline --qps 0.5 --output results/baseline.jsonl
@@ -21,7 +21,7 @@ from collections import defaultdict
 from openai import AsyncOpenAI
 import tiktoken
 
-# 全局单词池（与 test.py 一致）
+# 单词池常量（与 test.py 一致）
 WORD_POOL_SIZE = 10000
 COMMON_WORDS_FOR_POOL = [
     "the", "be", "to", "of", "and", "a", "in", "that", "have", "I",
@@ -36,8 +36,6 @@ COMMON_WORDS_FOR_POOL = [
     "even", "new", "want", "because", "any", "these", "give", "day", "most", "us",
 ]
 
-GLOBAL_WORD_LIST = [random.choice(COMMON_WORDS_FOR_POOL) for _ in range(WORD_POOL_SIZE)]
-
 
 class PrefetchABRunner:
     def __init__(
@@ -47,13 +45,19 @@ class PrefetchABRunner:
         model: str,
         mode: str,
         api_key: str = "dummy",
-        thinking_time: Optional[float] = None,
+        prefetch_lead_time: float = 0.2,
+        seed: int = 42,
     ):
         self.trace_file = trace_file
         self.api_base = api_base
         self.model = model
         self.mode = mode
-        self.thinking_time = thinking_time  # 固定 thinking time（秒），None 则从 trace 推导
+        self.prefetch_lead_time = prefetch_lead_time  # prefetch 提前量（秒），在 scheduled_time - lead_time 发送
+        self.seed = seed
+
+        # 在 seed 设置后生成单词池，确保两次运行生成完全相同的文本
+        random.seed(seed)
+        self.word_list = [random.choice(COMMON_WORDS_FOR_POOL) for _ in range(WORD_POOL_SIZE)]
 
         self.records = []
         self.chat_dict = {}
@@ -124,30 +128,46 @@ class PrefetchABRunner:
             return len(self.tokenizer.encode(text))
         return len(text) // 4
 
-    def _generate_text_with_tokens(self, target_tokens: int) -> str:
+    def _generate_text_with_tokens(
+        self,
+        target_tokens: int,
+        chat_id: Optional[int] = None,
+        turn: Optional[int] = None,
+        placeholder: bool = False,
+    ) -> str:
+        """生成具有指定 token 数量的文本。若提供 chat_id/turn，使用确定性子 seed 确保两次运行结果一致。"""
         if target_tokens <= 0:
             return ""
-        estimated_words = min(int(target_tokens * 1.5), WORD_POOL_SIZE)
-        start_idx = random.randint(0, max(0, WORD_POOL_SIZE - estimated_words))
-        if start_idx + estimated_words <= WORD_POOL_SIZE:
-            text = " ".join(GLOBAL_WORD_LIST[start_idx : start_idx + estimated_words])
-        else:
-            first = GLOBAL_WORD_LIST[start_idx:]
-            remaining = estimated_words - len(first)
-            second = GLOBAL_WORD_LIST[:remaining]
-            text = " ".join(first + second)
-        current = self._count_tokens(text)
-        while current < target_tokens and estimated_words < WORD_POOL_SIZE:
-            estimated_words += 10
+        # 使用确定性子 seed 时，保存并恢复主 RNG 状态
+        if chat_id is not None and turn is not None:
+            sub_seed = self.seed + chat_id * 1000 + turn + (500000 if placeholder else 0)
+            state = random.getstate()
+            random.seed(sub_seed)
+        try:
+            estimated_words = min(int(target_tokens * 1.5), WORD_POOL_SIZE)
+            start_idx = random.randint(0, max(0, WORD_POOL_SIZE - estimated_words))
             if start_idx + estimated_words <= WORD_POOL_SIZE:
-                text = " ".join(GLOBAL_WORD_LIST[start_idx : start_idx + estimated_words])
+                text = " ".join(self.word_list[start_idx : start_idx + estimated_words])
             else:
-                first = GLOBAL_WORD_LIST[start_idx:]
-                remaining = min(estimated_words - len(first), WORD_POOL_SIZE)
-                second = GLOBAL_WORD_LIST[:remaining]
+                first = self.word_list[start_idx:]
+                remaining = estimated_words - len(first)
+                second = self.word_list[:remaining]
                 text = " ".join(first + second)
             current = self._count_tokens(text)
-        return text
+            while current < target_tokens and estimated_words < WORD_POOL_SIZE:
+                estimated_words += 10
+                if start_idx + estimated_words <= WORD_POOL_SIZE:
+                    text = " ".join(self.word_list[start_idx : start_idx + estimated_words])
+                else:
+                    first = self.word_list[start_idx:]
+                    remaining = min(estimated_words - len(first), WORD_POOL_SIZE)
+                    second = self.word_list[:remaining]
+                    text = " ".join(first + second)
+                current = self._count_tokens(text)
+            return text
+        finally:
+            if chat_id is not None and turn is not None:
+                random.setstate(state)
 
     def _sample_workload(self, num_multi_turn: int, max_turns: Optional[int] = None) -> List[Tuple[str, List[Dict]]]:
         workload = []
@@ -173,18 +193,29 @@ class PrefetchABRunner:
             scheduled_map[(r["chat_id"], r["turn"])] = i * interval  # 相对时间
         return workload, scheduled_map
 
-    async def _send_prefetch(self, messages: List[Dict]) -> Tuple[float, Optional[str]]:
-        """发送 prefetch 请求，返回 (elapsed_sec, error_msg)"""
+    async def _send_prefetch(
+        self, messages: List[Dict]
+    ) -> Tuple[float, Optional[str], Optional[int], Optional[int]]:
+        """发送 prefetch 请求，返回 (elapsed_sec, error_msg, cached_tokens, prompt_tokens)"""
         start = time.perf_counter()
         try:
-            await self.client.chat.completions.create(
+            resp = await self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
                 extra_body={"prefetch": True},
             )
-            return time.perf_counter() - start, None
+            elapsed = time.perf_counter() - start
+            cached_tokens = None
+            prompt_tokens = None
+            if resp.usage:
+                prompt_tokens = resp.usage.prompt_tokens
+                if hasattr(resp.usage, "prompt_tokens_details") and resp.usage.prompt_tokens_details:
+                    details = resp.usage.prompt_tokens_details
+                    if hasattr(details, "cached_tokens"):
+                        cached_tokens = details.cached_tokens
+            return elapsed, None, cached_tokens, prompt_tokens
         except Exception as e:
-            return time.perf_counter() - start, str(e)
+            return time.perf_counter() - start, str(e), None, None
 
     async def _send_streaming_request(
         self,
@@ -233,9 +264,16 @@ class PrefetchABRunner:
         gen_time = total_time - ttft if total_time > ttft else 0.001
         tokens_per_sec = completion_tokens / gen_time if gen_time > 0 else 0
 
+        # TPOT: Time Per Output Token (秒/token)，与旧 test.py 一致
+        if completion_tokens > 1 and first_token_time:
+            tpot = (end - first_token_time) / (completion_tokens - 1)
+        else:
+            tpot = 0.0
+
         return {
             "ttft": ttft,
             "total_time": total_time,
+            "tpot": tpot,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "cached_tokens": cached_tokens,
@@ -244,15 +282,6 @@ class PrefetchABRunner:
             "error": error_msg,
             "text": text,
         }
-
-    def _get_thinking_time(self, chain: List[Dict], req_idx: int) -> float:
-        if self.thinking_time is not None:
-            return self.thinking_time
-        if req_idx == 0:
-            return 0.0
-        prev_ts = chain[req_idx - 1]["timestamp"]
-        curr_ts = chain[req_idx]["timestamp"]
-        return max(0.0, curr_ts - prev_ts)
 
     async def _process_conversation(
         self,
@@ -270,6 +299,28 @@ class PrefetchABRunner:
 
             key = (record["chat_id"], record["turn"])
             scheduled_abs = scheduled_map.get(key, test_start_time)
+
+            # Lead-time 模型：prefetch 在 scheduled_abs - lead_time 发送（仅多轮且有历史）
+            prefetch_time_ms = None
+            prefetch_cached_tokens = None
+            prefetch_prompt_tokens = None
+            if self.mode == "prefetch" and conv_type == "multi" and messages:
+                prefetch_at = scheduled_abs - self.prefetch_lead_time
+                wait_prefetch = prefetch_at - time.time()
+                if wait_prefetch > 0:
+                    await asyncio.sleep(wait_prefetch)
+                if self._is_timeout():
+                    break
+                elapsed, err, cached, ptokens = await self._send_prefetch(messages.copy())
+                prefetch_time_ms = elapsed * 1000
+                prefetch_cached_tokens = cached
+                prefetch_prompt_tokens = ptokens
+                if err:
+                    print(f"[Prefetch 失败] chat_id={record['chat_id']} turn={record['turn']}: {err}")
+                elif cached is not None and cached > 0:
+                    print(f"[Prefetch 命中] chat_id={record['chat_id']} turn={record['turn']}: cached={cached}")
+
+            # 等待到该轮次的预定发送时间
             wait_time = scheduled_abs - time.time()
             if wait_time > 0:
                 await asyncio.sleep(wait_time)
@@ -278,26 +329,25 @@ class PrefetchABRunner:
 
             history_tokens = self._count_tokens("\n".join(f"{m['role']}: {m['content']}" for m in messages)) if messages else 0
             new_user_tokens = max(10, record["input_length"] - history_tokens)
-            user_msg = self._generate_text_with_tokens(new_user_tokens)
+            user_msg = self._generate_text_with_tokens(
+                new_user_tokens, chat_id=record["chat_id"], turn=record["turn"]
+            )
             messages.append({"role": "user", "content": user_msg})
-
-            prefetch_time_ms = None
-            if self.mode == "prefetch" and conv_type == "multi" and len(messages) > 1:
-                history_messages = messages[:-1]
-                thinking = self._get_thinking_time(chain, i)
-                if thinking > 0:
-                    await asyncio.sleep(thinking)
-                elapsed, err = await self._send_prefetch(history_messages)
-                prefetch_time_ms = elapsed * 1000
-                if err:
-                    print(f"[Prefetch 失败] chat_id={record['chat_id']} turn={record['turn']}: {err}")
 
             result = await self._send_streaming_request(messages, record["output_length"])
 
             if result["success"] and result.get("text"):
                 messages.append({"role": "assistant", "content": result["text"]})
             else:
-                messages.append({"role": "assistant", "content": self._generate_text_with_tokens(record["output_length"])})
+                messages.append({
+                    "role": "assistant",
+                    "content": self._generate_text_with_tokens(
+                        record["output_length"],
+                        chat_id=record["chat_id"],
+                        turn=record["turn"],
+                        placeholder=True,
+                    ),
+                })
 
             log_row = {
                 "chat_id": record["chat_id"],
@@ -305,12 +355,16 @@ class PrefetchABRunner:
                 "mode": self.mode,
                 "is_multi_turn": conv_type == "multi",
                 "ttft_ms": result["ttft"] * 1000,
+                "tpot_ms": result["tpot"] * 1000,
                 "total_time_ms": result["total_time"] * 1000,
                 "tokens_per_sec": result["tokens_per_sec"],
                 "prompt_tokens": result["prompt_tokens"],
                 "completion_tokens": result["completion_tokens"],
                 "cached_tokens": result["cached_tokens"],
                 "prefetch_time_ms": prefetch_time_ms,
+                "prefetch_cached_tokens": prefetch_cached_tokens,
+                "prefetch_prompt_tokens": prefetch_prompt_tokens,
+                "history_tokens": history_tokens if conv_type == "multi" else None,
                 "success": result["success"],
                 "error": result["error"],
                 "timestamp": time.time(),
@@ -377,8 +431,9 @@ async def main():
     parser.add_argument("--num-multi-turn", type=int, default=50)
     parser.add_argument("--max-turns", type=int, default=None)
     parser.add_argument("--output", required=True, help="输出 JSONL 路径")
-    parser.add_argument("--thinking-time", type=float, default=None, help="固定 thinking time（秒），默认从 trace 推导")
+    parser.add_argument("--prefetch-lead-time", type=float, default=0.2, help="Prefetch 提前量（秒），在 scheduled_time - lead_time 发送 prefetch")
     parser.add_argument("--timeout", type=float, default=None)
+    parser.add_argument("--seed", type=int, default=42, help="随机种子，确保两次运行生成完全相同的对话文本")
     args = parser.parse_args()
 
     runner = PrefetchABRunner(
@@ -386,7 +441,8 @@ async def main():
         api_base=args.api_base,
         model=args.model,
         mode=args.mode,
-        thinking_time=args.thinking_time,
+        prefetch_lead_time=args.prefetch_lead_time,
+        seed=args.seed,
     )
     await runner.run(
         num_multi_turn=args.num_multi_turn,
