@@ -31,8 +31,8 @@ VLLM_LOG="${VLLM_LOG:-vllm_state.log}"
 [[ "$VLLM_LOG" != /* ]] && VLLM_LOG="$SCRIPT_DIR/$VLLM_LOG"
 SEED="${SEED:-42}"
 
-# 结果目录带 QPS 标识
-RESULTS_DIR="results/$(date +%Y%m%d_%H%M%S)_qps${QPS}"
+# 结果目录：项目根 results/xxxx
+RESULTS_DIR="$PROJECT_ROOT/results/$(date +%Y%m%d_%H%M%S)_qps${QPS}"
 mkdir -p "$RESULTS_DIR"
 
 echo "============================================"
@@ -107,6 +107,9 @@ python3 -u "$PROJECT_ROOT/result-analysis/generate_report.py" \
   --config "$CONFIG_STR" \
   --vllm-config "MODEL_PATH=$MODEL, VLLM_LOG=$VLLM_LOG, KV_OFFLOADING_SIZE=${KV_OFFLOADING_SIZE:-5}, GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.5}, NUM_GPU_BLOCKS_OVERRIDE=${NUM_GPU_BLOCKS_OVERRIDE:-115}, SWAP_SPACE=${SWAP_SPACE:-256}" \
   --test-config "TRACE=$TRACE, TIMEOUT=${TIMEOUT:-}, API_BASE=$API_BASE"
+
+# 复制 vLLM 日志到结果目录
+[ -f "$VLLM_LOG" ] && cp "$VLLM_LOG" "$RESULTS_DIR/vllm_state.log" 2>/dev/null || true
 
 echo ""
 echo "============================================"

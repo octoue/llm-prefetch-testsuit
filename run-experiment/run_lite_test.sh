@@ -44,10 +44,9 @@ if [ ! -f "$TRACE" ]; then
     python3 "$PROJECT_ROOT/data/prepare_lite_dataset.py" --trace-file "$FULL_TRACE" --output "$TRACE"
 fi
 
-# 结果目录
-RESULTS_DIR="results/lite_$(date +%Y%m%d_%H%M%S)_qps${QPS}"
-mkdir -p "$RESULTS_DIR"
-TB_DIR="$SCRIPT_DIR/runs/lite_$(date +%Y%m%d_%H%M%S)"
+# 结果目录：项目根 results/xxxx，TensorBoard 放在同一目录下
+RESULTS_DIR="$PROJECT_ROOT/results/lite_$(date +%Y%m%d_%H%M%S)_qps${QPS}"
+TB_DIR="$RESULTS_DIR/tensorboard"
 mkdir -p "$TB_DIR"
 
 # 预估运行时间（调度跨度 + 缓冲）
@@ -71,9 +70,9 @@ echo "结果目录: $RESULTS_DIR"
 echo "TensorBoard: $TB_DIR"
 echo "============================================"
 
-# 启动 TensorBoard（后台）
+# 启动 TensorBoard（后台，logdir 指向当前 run 的 tensorboard 目录）
 if command -v tensorboard &>/dev/null; then
-    tensorboard --logdir "$(dirname "$TB_DIR")" --port "$TB_PORT" &
+    tensorboard --logdir "$TB_DIR" --port "$TB_PORT" &
     TB_PID=$!
     echo "TensorBoard 已启动 (PID=$TB_PID), http://localhost:$TB_PORT"
 else
@@ -94,7 +93,7 @@ python3 -u "$SCRIPT_DIR/prefetch_ab_runner.py" \
   --seed "$SEED" \
   --timeout "$TIMEOUT" \
   --request-timeout "$REQUEST_TIMEOUT" \
-  --tensorboard-dir "${TB_DIR}_prefetch" \
+  --tensorboard-dir "${TB_DIR}/prefetch" \
   &> "$RESULTS_DIR/prefetch.log"
 grep "Avg prompt throughput" "$VLLM_LOG" >> "$RESULTS_DIR/prefetch.log" 2>/dev/null || true
 
@@ -123,7 +122,7 @@ python3 -u "$SCRIPT_DIR/prefetch_ab_runner.py" \
   --seed "$SEED" \
   --timeout "$TIMEOUT" \
   --request-timeout "$REQUEST_TIMEOUT" \
-  --tensorboard-dir "${TB_DIR}_baseline" \
+  --tensorboard-dir "${TB_DIR}/baseline" \
   &> "$RESULTS_DIR/baseline.log"
 grep "Avg prompt throughput" "$VLLM_LOG" >> "$RESULTS_DIR/baseline.log" 2>/dev/null || true
 
@@ -140,8 +139,11 @@ python3 -u "$PROJECT_ROOT/result-analysis/generate_report.py" \
   --vllm-config "MODEL_PATH=$MODEL, VLLM_LOG=$VLLM_LOG, KV_OFFLOADING_SIZE=${KV_OFFLOADING_SIZE:-5}, GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.5}, NUM_GPU_BLOCKS_OVERRIDE=${NUM_GPU_BLOCKS_OVERRIDE:-115}, SWAP_SPACE=${SWAP_SPACE:-256}" \
   --test-config "TRACE=$TRACE, FULL_TRACE=$FULL_TRACE, TIMEOUT=$TIMEOUT, REQUEST_TIMEOUT=$REQUEST_TIMEOUT, API_BASE=$API_BASE"
 
+# 复制 vLLM 日志到结果目录
+[ -f "$VLLM_LOG" ] && cp "$VLLM_LOG" "$RESULTS_DIR/vllm_state.log" 2>/dev/null || true
+
 echo ""
 echo "============================================"
 echo "完成! 报告: $RESULTS_DIR/report.md"
-[ -n "${TB_PID:-}" ] && echo "TensorBoard: http://localhost:$TB_PORT"
+[ -n "${TB_PID:-}" ] && echo "TensorBoard: http://localhost:$TB_PORT (logdir: $TB_DIR)"
 echo "============================================"
