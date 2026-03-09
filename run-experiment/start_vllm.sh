@@ -9,16 +9,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-[ -f "$SCRIPT_DIR/config.env" ] && set -a && source "$SCRIPT_DIR/config.env" && set +a
+[ -f "$SCRIPT_DIR/config.env" ] || { echo "错误: 缺少 config.env"; exit 1; }
+set -a && source "$SCRIPT_DIR/config.env" && set +a
 
-# 默认值（当 config.env 未定义时）
-MODEL_PATH="${MODEL_PATH:-/lpai/models/Qwen__Qwen3-8B/25-07-26-0349}"
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.5}"
-NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE:-115}"
-KV_OFFLOADING_SIZE="${KV_OFFLOADING_SIZE:-5}"
-SWAP_SPACE="${SWAP_SPACE:-256}"
-API_PORT="${API_PORT:-8000}"
-VLLM_LOG="${VLLM_LOG:-vllm_state.log}"
 [[ "$VLLM_LOG" != /* ]] && VLLM_LOG="$SCRIPT_DIR/$VLLM_LOG"
 
 # 自动选择显存最空闲的 1 张 GPU（8B 模型单卡即可）
@@ -31,17 +24,17 @@ fi
 echo "Selected GPU(s): $FREE_GPUS"
 echo "Model: $MODEL_PATH (local, HF_HUB_OFFLINE=1)"
 echo "GPU_MEMORY_UTILIZATION=$GPU_MEMORY_UTILIZATION, NUM_GPU_BLOCKS_OVERRIDE=$NUM_GPU_BLOCKS_OVERRIDE"
-echo "KV_OFFLOADING_SIZE=${KV_OFFLOADING_SIZE:-0}, SWAP_SPACE=${SWAP_SPACE:-256}"
+echo "KV_OFFLOADING_SIZE=${KV_OFFLOADING_SIZE}, SWAP_SPACE=${SWAP_SPACE}"
 echo "VLLM_SERVER_DEV_MODE=1 (enabled for /reset_prefix_cache)"
 
 # 构建启动参数
 CMD_ARGS=(
   --model "$MODEL_PATH"
-  --host 0.0.0.0
+  --host "$VLLM_HOST"
   --port "$API_PORT"
-  --max-num-seqs 256
-  --block-size 16
-  --tensor-parallel-size 1
+  --max-num-seqs "$VLLM_MAX_NUM_SEQS"
+  --block-size "$VLLM_BLOCK_SIZE"
+  --tensor-parallel-size "$VLLM_TENSOR_PARALLEL_SIZE"
   --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
   --enable-prefix-caching
   --enable-prompt-tokens-details

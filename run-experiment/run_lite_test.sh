@@ -4,10 +4,7 @@
 #
 # 用法: ./run_lite_test.sh
 #
-# 与 run_ab_test.sh 的区别:
-# - 使用 lite_dataset.jsonl（9 个对话，约 55 请求）
-# - 默认 TIMEOUT=300, REQUEST_TIMEOUT=120
-# - 启用 TensorBoard 实时监控
+# 参数来自 config.env（使用 LITE_* 配置项）
 #
 # 前提: vLLM server 已启动
 #   ./start_vllm.sh
@@ -19,24 +16,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$SCRIPT_DIR"
 
-[ -f "$SCRIPT_DIR/config.env" ] && set -a && source "$SCRIPT_DIR/config.env" && set +a
+[ -f "$SCRIPT_DIR/config.env" ] || { echo "错误: 缺少 config.env"; exit 1; }
+set -a && source "$SCRIPT_DIR/config.env" && set +a
 
-# 轻量化测试默认参数（LITE_* 优先于通用 TRACE）
-QPS="${QPS:-0.8}"
-NUM_CONV="${NUM_CONV:-9}"
-TIMEOUT="${TIMEOUT:-300}"
-REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-120}"
-TRACE="${LITE_TRACE:-${TRACE:-$PROJECT_ROOT/data/lite_dataset.jsonl}}"
-FULL_TRACE="${LITE_FULL_TRACE:-${FULL_TRACE:-$PROJECT_ROOT/data/qwen_traceA_blksz_16.jsonl}}"
+# run_lite_test 使用 LITE_* 参数
+QPS="$LITE_QPS"
+NUM_CONV="$LITE_NUM_CONV"
+TIMEOUT="$LITE_TIMEOUT"
+TRACE="$LITE_TRACE"
+FULL_TRACE="$LITE_FULL_TRACE"
 [[ "$TRACE" != /* ]] && TRACE="$PROJECT_ROOT/$TRACE"
 [[ "$FULL_TRACE" != /* ]] && FULL_TRACE="$PROJECT_ROOT/$FULL_TRACE"
-MODEL="${MODEL_PATH:-/lpai/models/Qwen__Qwen3-8B/25-07-26-0349}"
-API_BASE="${API_BASE:-http://localhost:8000/v1}"
-API_HOST="${API_HOST:-localhost:8000}"
-VLLM_LOG="${VLLM_LOG:-vllm_state.log}"
 [[ "$VLLM_LOG" != /* ]] && VLLM_LOG="$SCRIPT_DIR/$VLLM_LOG"
-SEED="${SEED:-42}"
-TB_PORT="${TB_PORT:-6006}"
 
 # 若 lite_dataset.jsonl 不存在，先生成
 if [ ! -f "$TRACE" ]; then
@@ -87,7 +78,7 @@ python3 -u "$SCRIPT_DIR/prefetch_ab_runner.py" \
   --mode prefetch \
   --qps "$QPS" \
   --num-multi-turn "$NUM_CONV" \
-  --model "$MODEL" \
+  --model "$MODEL_PATH" \
   --api-base "$API_BASE" \
   --output "$RESULTS_DIR/prefetch.jsonl" \
   --seed "$SEED" \
@@ -116,7 +107,7 @@ python3 -u "$SCRIPT_DIR/prefetch_ab_runner.py" \
   --mode baseline \
   --qps "$QPS" \
   --num-multi-turn "$NUM_CONV" \
-  --model "$MODEL" \
+  --model "$MODEL_PATH" \
   --api-base "$API_BASE" \
   --output "$RESULTS_DIR/baseline.jsonl" \
   --seed "$SEED" \
@@ -130,13 +121,13 @@ grep "Avg prompt throughput" "$VLLM_LOG" >> "$RESULTS_DIR/baseline.log" 2>/dev/n
 echo ""
 echo "[Phase 3] 生成报告..."
 CONFIG_STR="QPS=$QPS, NUM_CONV=$NUM_CONV, SEED=$SEED, LITE=1"
-[ -n "${KV_OFFLOADING_SIZE:-}" ] && CONFIG_STR="$CONFIG_STR, KV_OFFLOADING_SIZE=$KV_OFFLOADING_SIZE"
+[ -n "$KV_OFFLOADING_SIZE" ] && CONFIG_STR="$CONFIG_STR, KV_OFFLOADING_SIZE=$KV_OFFLOADING_SIZE"
 python3 -u "$PROJECT_ROOT/result-analysis/generate_report.py" \
   --baseline "$RESULTS_DIR/baseline.jsonl" \
   --prefetch "$RESULTS_DIR/prefetch.jsonl" \
   --output "$RESULTS_DIR/report.md" \
   --config "$CONFIG_STR" \
-  --vllm-config "MODEL_PATH=$MODEL, VLLM_LOG=$VLLM_LOG, KV_OFFLOADING_SIZE=${KV_OFFLOADING_SIZE:-5}, GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.5}, NUM_GPU_BLOCKS_OVERRIDE=${NUM_GPU_BLOCKS_OVERRIDE:-115}, SWAP_SPACE=${SWAP_SPACE:-256}" \
+  --vllm-config "MODEL_PATH=$MODEL_PATH, VLLM_LOG=$VLLM_LOG, KV_OFFLOADING_SIZE=$KV_OFFLOADING_SIZE, GPU_MEMORY_UTILIZATION=$GPU_MEMORY_UTILIZATION, NUM_GPU_BLOCKS_OVERRIDE=$NUM_GPU_BLOCKS_OVERRIDE, SWAP_SPACE=$SWAP_SPACE" \
   --test-config "TRACE=$TRACE, FULL_TRACE=$FULL_TRACE, TIMEOUT=$TIMEOUT, REQUEST_TIMEOUT=$REQUEST_TIMEOUT, API_BASE=$API_BASE"
 
 # 复制 vLLM 日志到结果目录

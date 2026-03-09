@@ -3,8 +3,7 @@
 # Prefetch A/B 实验编排脚本（单 QPS 模式）
 #
 # 用法: ./run_ab_test.sh
-#   或: QPS=0.5 NUM_CONV=50 ./run_ab_test.sh
-#   或: QPS=0.3 TIMEOUT=120 ./run_ab_test.sh
+# 参数来自 config.env
 #
 # 前提: vLLM server 已启动（使用本地模型、离线模式）:
 #   ./start_vllm.sh
@@ -16,20 +15,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$SCRIPT_DIR"
 
-[ -f "$SCRIPT_DIR/config.env" ] && set -a && source "$SCRIPT_DIR/config.env" && set +a
+[ -f "$SCRIPT_DIR/config.env" ] || { echo "错误: 缺少 config.env"; exit 1; }
+set -a && source "$SCRIPT_DIR/config.env" && set +a
 
-# 默认值
-QPS="${QPS:-0.5}"
-NUM_CONV="${NUM_CONV:-50}"
-TRACE="${TRACE:-$PROJECT_ROOT/data/qwen_traceA_blksz_16.jsonl}"
 [[ "$TRACE" != /* ]] && TRACE="$PROJECT_ROOT/$TRACE"
-MODEL="${MODEL_PATH:-/lpai/models/Qwen__Qwen3-8B/25-07-26-0349}"
-API_BASE="${API_BASE:-http://localhost:8000/v1}"
-API_HOST="${API_HOST:-localhost:8000}"
-API_PORT="${API_PORT:-8000}"
-VLLM_LOG="${VLLM_LOG:-vllm_state.log}"
 [[ "$VLLM_LOG" != /* ]] && VLLM_LOG="$SCRIPT_DIR/$VLLM_LOG"
-SEED="${SEED:-42}"
 
 # 结果目录：项目根 results/xxxx
 RESULTS_DIR="$PROJECT_ROOT/results/$(date +%Y%m%d_%H%M%S)_qps${QPS}"
@@ -41,7 +31,7 @@ echo "============================================"
 echo "QPS: $QPS"
 echo "多轮对话数: $NUM_CONV"
 echo "Trace: $TRACE"
-echo "Model: $MODEL"
+echo "Model: $MODEL_PATH"
 echo "结果目录: $RESULTS_DIR"
 echo "============================================"
 
@@ -60,7 +50,7 @@ python3 -u "$SCRIPT_DIR/prefetch_ab_runner.py" \
   --mode prefetch \
   --qps "$QPS" \
   --num-multi-turn "$NUM_CONV" \
-  --model "$MODEL" \
+  --model "$MODEL_PATH" \
   --api-base "$API_BASE" \
   --output "$RESULTS_DIR/prefetch.jsonl" \
   --seed "$SEED" \
@@ -87,7 +77,7 @@ python3 -u "$SCRIPT_DIR/prefetch_ab_runner.py" \
   --mode baseline \
   --qps "$QPS" \
   --num-multi-turn "$NUM_CONV" \
-  --model "$MODEL" \
+  --model "$MODEL_PATH" \
   --api-base "$API_BASE" \
   --output "$RESULTS_DIR/baseline.jsonl" \
   --seed "$SEED" \
@@ -99,14 +89,14 @@ grep "Avg prompt throughput" "$VLLM_LOG" >> "$RESULTS_DIR/baseline.log" 2>/dev/n
 echo ""
 echo "[Phase 3] 生成报告..."
 CONFIG_STR="QPS=$QPS, NUM_CONV=$NUM_CONV, SEED=$SEED"
-[ -n "${KV_OFFLOADING_SIZE:-}" ] && CONFIG_STR="$CONFIG_STR, KV_OFFLOADING_SIZE=$KV_OFFLOADING_SIZE"
+[ -n "$KV_OFFLOADING_SIZE" ] && CONFIG_STR="$CONFIG_STR, KV_OFFLOADING_SIZE=$KV_OFFLOADING_SIZE"
 python3 -u "$PROJECT_ROOT/result-analysis/generate_report.py" \
   --baseline "$RESULTS_DIR/baseline.jsonl" \
   --prefetch "$RESULTS_DIR/prefetch.jsonl" \
   --output "$RESULTS_DIR/report.md" \
   --config "$CONFIG_STR" \
-  --vllm-config "MODEL_PATH=$MODEL, VLLM_LOG=$VLLM_LOG, KV_OFFLOADING_SIZE=${KV_OFFLOADING_SIZE:-5}, GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.5}, NUM_GPU_BLOCKS_OVERRIDE=${NUM_GPU_BLOCKS_OVERRIDE:-115}, SWAP_SPACE=${SWAP_SPACE:-256}" \
-  --test-config "TRACE=$TRACE, TIMEOUT=${TIMEOUT:-}, API_BASE=$API_BASE"
+  --vllm-config "MODEL_PATH=$MODEL_PATH, VLLM_LOG=$VLLM_LOG, KV_OFFLOADING_SIZE=$KV_OFFLOADING_SIZE, GPU_MEMORY_UTILIZATION=$GPU_MEMORY_UTILIZATION, NUM_GPU_BLOCKS_OVERRIDE=$NUM_GPU_BLOCKS_OVERRIDE, SWAP_SPACE=$SWAP_SPACE" \
+  --test-config "TRACE=$TRACE, TIMEOUT=$TIMEOUT, API_BASE=$API_BASE"
 
 # 复制 vLLM 日志到结果目录
 [ -f "$VLLM_LOG" ] && cp "$VLLM_LOG" "$RESULTS_DIR/vllm_state.log" 2>/dev/null || true
