@@ -2,7 +2,9 @@
 #
 # 轻量化 Prefetch A/B 测试（对应 test.sh 的替代链路）
 #
-# 用法: ./run_lite_test.sh
+# 用法: ./run_lite_test.sh [qps] [--no-tensorboard]
+#   qps 可选，不传则用 config.env 的 LITE_QPS
+#   --no-tensorboard  可选，加上则禁用 TensorBoard（默认启用）
 #
 # 参数来自 config.env（使用 LITE_* 配置项）
 #
@@ -19,8 +21,16 @@ cd "$SCRIPT_DIR"
 [ -f "$SCRIPT_DIR/config.env" ] || { echo "错误: 缺少 config.env"; exit 1; }
 set -a && source "$SCRIPT_DIR/config.env" && set +a
 
-# run_lite_test 使用 LITE_* 参数
+# 解析命令行参数：qps 和 --no-tensorboard
 QPS="$LITE_QPS"
+NO_TENSORBOARD=""
+for arg in "$@"; do
+  if [ "$arg" = "--no-tensorboard" ]; then
+    NO_TENSORBOARD=1
+  elif [[ "$arg" =~ ^[0-9.]+$ ]]; then
+    QPS="$arg"
+  fi
+done
 NUM_CONV="$LITE_NUM_CONV"
 TIMEOUT="$LITE_TIMEOUT"
 TRACE="$LITE_TRACE"
@@ -29,16 +39,21 @@ FULL_TRACE="$LITE_FULL_TRACE"
 [[ "$FULL_TRACE" != /* ]] && FULL_TRACE="$PROJECT_ROOT/$FULL_TRACE"
 [[ "$VLLM_LOG" != /* ]] && VLLM_LOG="$SCRIPT_DIR/$VLLM_LOG"
 
-# 若 lite_dataset.jsonl 不存在，先生成
+# 若 lite_dataset.jsonl 不存在，先生成（使用推荐参数：max-input-length 3000, short 3, medium 8, long 7）
 if [ ! -f "$TRACE" ]; then
     echo "生成轻量化数据集: $TRACE"
-    python3 "$PROJECT_ROOT/data/prepare_lite_dataset.py" --trace-file "$FULL_TRACE" --output "$TRACE"
+    python3 "$PROJECT_ROOT/data/prepare_lite_dataset.py" \
+        --trace-file "$FULL_TRACE" \
+        --output "$TRACE" \
+        --max-input-length 3000 \
+        --short 3 --medium 8 --long 7 \
+        --seed "$SEED"
 fi
 
-# 结果目录：项目根 results/xxxx，TensorBoard 放在同一目录下
-RESULTS_DIR="$PROJECT_ROOT/results/lite_$(date +%Y%m%d_%H%M%S)_qps${QPS}"
-TB_DIR="$RESULTS_DIR/tensorboard"
-mkdir -p "$TB_DIR"
+# 结果目录：项目根 results/lite_qpsX.X，便于对比
+RESULTS_DIR="$PROJECT_ROOT/results/lite_qps${QPS}"
+mkdir -p "$RESULTS_DIR"
+[ -z "$NO_TENSORBOARD" ] && TB_DIR="$RESULTS_DIR/tensorboard" || TB_DIR=""
 
 # 预估运行时间（调度跨度 + 缓冲）
 TOTAL_REQUESTS=$(python3 -c "
@@ -58,19 +73,30 @@ echo "QPS: $QPS, 对话数: $NUM_CONV"
 echo "TIMEOUT: $TIMEOUT s, REQUEST_TIMEOUT: $REQUEST_TIMEOUT s"
 echo "预估调度跨度: ~${EST_SCHEDULE}s"
 echo "结果目录: $RESULTS_DIR"
-echo "TensorBoard: $TB_DIR"
+[ -n "$TB_DIR" ] && echo "TensorBoard: $TB_DIR" || echo "TensorBoard: 已禁用"
 echo "============================================"
 
 # 启动 TensorBoard（后台，logdir 指向当前 run 的 tensorboard 目录）
-if command -v tensorboard &>/dev/null; then
+if [ -z "$NO_TENSORBOARD" ] && [ -n "$TB_DIR" ]; then
+  if command -v tensorboard &>/dev/null; then
     tensorboard --logdir "$TB_DIR" --port "$TB_PORT" &
     TB_PID=$!
     echo "TensorBoard 已启动 (PID=$TB_PID), http://localhost:$TB_PORT"
-else
+  else
     echo "未找到 tensorboard 命令，跳过 TensorBoard"
+  fi
 fi
 
+# 每次测试开始前清空 cache，确保 Prefetch 从干净状态启动（多 QPS sweep 时各 QPS 互不影响）
+echo ""
+echo "清空 prefix cache 和 connector cache（确保 Prefetch 从干净状态开始）..."
+curl -s -X POST "http://${API_HOST}/reset_prefix_cache?reset_external=true" || true
+sleep 5
+echo "Cache 已重置。"
+
 # Phase 1: Prefetch
+TB_PREFETCH_ARGS=()
+[ -n "$TB_DIR" ] && TB_PREFETCH_ARGS=(--tensorboard-dir "${TB_DIR}/prefetch")
 echo ""
 echo "[Phase 1] 运行 Prefetch..."
 python3 -u "$SCRIPT_DIR/prefetch_ab_runner.py" \
@@ -84,7 +110,8 @@ python3 -u "$SCRIPT_DIR/prefetch_ab_runner.py" \
   --seed "$SEED" \
   --timeout "$TIMEOUT" \
   --request-timeout "$REQUEST_TIMEOUT" \
-  --tensorboard-dir "${TB_DIR}/prefetch" \
+  --prefetch-lead-time "${PREFETCH_LEAD_TIME:-3.0}" \
+  "${TB_PREFETCH_ARGS[@]}" \
   &> "$RESULTS_DIR/prefetch.log"
 grep "Avg prompt throughput" "$VLLM_LOG" >> "$RESULTS_DIR/prefetch.log" 2>/dev/null || true
 
@@ -100,6 +127,8 @@ sleep 5
 echo "Cache 已重置。"
 
 # Phase 2: Baseline
+TB_BASELINE_ARGS=()
+[ -n "$TB_DIR" ] && TB_BASELINE_ARGS=(--tensorboard-dir "${TB_DIR}/baseline")
 echo ""
 echo "[Phase 2] 运行 Baseline (无 prefetch)..."
 python3 -u "$SCRIPT_DIR/prefetch_ab_runner.py" \
@@ -113,7 +142,7 @@ python3 -u "$SCRIPT_DIR/prefetch_ab_runner.py" \
   --seed "$SEED" \
   --timeout "$TIMEOUT" \
   --request-timeout "$REQUEST_TIMEOUT" \
-  --tensorboard-dir "${TB_DIR}/baseline" \
+  "${TB_BASELINE_ARGS[@]}" \
   &> "$RESULTS_DIR/baseline.log"
 grep "Avg prompt throughput" "$VLLM_LOG" >> "$RESULTS_DIR/baseline.log" 2>/dev/null || true
 

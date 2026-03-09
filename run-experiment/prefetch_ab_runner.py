@@ -353,8 +353,13 @@ class PrefetchABRunner:
                 prefetch_prompt_tokens = ptokens
                 if err:
                     print(f"[Prefetch 失败] chat_id={record['chat_id']} turn={record['turn']}: {err}")
-                elif cached is not None and cached > 0:
-                    print(f"[Prefetch 命中] chat_id={record['chat_id']} turn={record['turn']}: cached={cached}")
+                elif cached is not None and cached > 0 and ptokens is not None:
+                    hit_ratio = cached / ptokens if ptokens > 0 else 0
+                    source = "GPU_HIT" if elapsed < 0.1 else "CPU_LOAD"
+                    print(
+                        f"[Prefetch {source}] chat_id={record['chat_id']} turn={record['turn']}: "
+                        f"cached={cached}/{ptokens} ({hit_ratio:.0%}), elapsed={elapsed*1000:.0f}ms"
+                    )
 
             # 等待到该轮次的预定发送时间
             wait_time = scheduled_abs - time.time()
@@ -398,6 +403,7 @@ class PrefetchABRunner:
                 "completion_tokens": result["completion_tokens"],
                 "cached_tokens": result["cached_tokens"],
                 "prefetch_time_ms": prefetch_time_ms,
+                "prefetch_elapsed_ms": prefetch_time_ms,
                 "prefetch_cached_tokens": prefetch_cached_tokens,
                 "prefetch_prompt_tokens": prefetch_prompt_tokens,
                 "history_tokens": history_tokens if conv_type == "multi" else None,

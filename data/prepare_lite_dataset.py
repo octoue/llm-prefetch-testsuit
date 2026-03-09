@@ -66,6 +66,8 @@ def main():
     parser.add_argument("--short", type=int, default=3, help="短对话（2-3 轮）选取数量")
     parser.add_argument("--medium", type=int, default=3, help="中等对话（4-8 轮）选取数量")
     parser.add_argument("--long", type=int, default=3, help="长对话（9+ 轮）选取数量")
+    parser.add_argument("--max-input-length", type=int, default=None,
+                        help="排除对话链中任何一轮 input_length 超过此值的整条链")
     parser.add_argument("--seed", type=int, default=42, help="随机种子，确保每次运行结果相同")
     args = parser.parse_args()
 
@@ -86,6 +88,10 @@ def main():
 
     for root_id in multi_turn_roots:
         chain = get_conversation_chain(root_id, chat_dict, children_dict)
+        # 过滤超大链：任何一轮 input_length 超过阈值则排除整条链
+        if args.max_input_length is not None:
+            if max(r["input_length"] for r in chain) > args.max_input_length:
+                continue
         num_turns = len(chain)
         total_tokens = sum(r["input_length"] + r["output_length"] for r in chain)
         if 2 <= num_turns <= 3:

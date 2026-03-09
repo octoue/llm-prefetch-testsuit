@@ -57,4 +57,6 @@ fi
 
 # VLLM_SERVER_DEV_MODE=1 启用 /reset_prefix_cache 等开发端点（用于 A/B 实验间清空 cache）
 # HF_HUB_OFFLINE=1 使用本地模型，不联网
+# 可通过 VLLM_LOG_LEVEL=DEBUG ./start_vllm.sh 开启详细日志
+export VLLM_LOGGING_LEVEL="${VLLM_LOG_LEVEL:-INFO}"
 VLLM_SERVER_DEV_MODE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=$FREE_GPUS vllm serve "${CMD_ARGS[@]}" | tee "$VLLM_LOG"

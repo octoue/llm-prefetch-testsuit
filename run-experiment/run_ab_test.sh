@@ -42,6 +42,13 @@ if [ -n "$TIMEOUT" ]; then
   echo "Timeout: $TIMEOUT 秒"
 fi
 
+# 每次测试开始前清空 cache，确保 Prefetch 从干净状态启动
+echo ""
+echo "清空 prefix cache 和 connector cache（确保 Prefetch 从干净状态开始）..."
+curl -s -X POST "http://${API_HOST}/reset_prefix_cache?reset_external=true" || true
+sleep 5
+echo "Cache 已重置。"
+
 # Phase 1: Prefetch（与旧 full-test.sh 顺序一致：prefetch first）
 echo ""
 echo "[Phase 1] 运行 Prefetch..."
