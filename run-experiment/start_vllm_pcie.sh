@@ -1,6 +1,6 @@
 #!/bin/bash
 # vLLM 启动脚本（PCIe Profiling 版）
-# 在 start_vllm.sh 基础上增加：禁用 NVLink、PyTorch Profiler、PCIeTracer
+# 在 start_vllm.sh 基础上增加：禁用 NVLink、轻量 PCIe Profiler（仅 PCIeTracer，无 torch 开销）
 # 用法: ./start_vllm_pcie.sh
 # 配合 run_lite_test_pcie.sh 使用，采集 KV Offload / Prefetch 的 PCIe 带宽数据
 
@@ -61,7 +61,7 @@ CMD_ARGS=(
   --enable-prompt-tokens-details
   --trust-remote-code
   --disable-hybrid-kv-cache-manager
-  --profiler-config "{\"profiler\": \"torch\", \"torch_profiler_dir\": \"$PCIE_PROFILER_DIR\"}"
+  --profiler-config "{\"profiler\": \"pcie\", \"torch_profiler_dir\": \"$PCIE_PROFILER_DIR\"}"
 )
 
 if [ -n "$NUM_GPU_BLOCKS_OVERRIDE" ] && [ "$NUM_GPU_BLOCKS_OVERRIDE" != "auto" ]; then
