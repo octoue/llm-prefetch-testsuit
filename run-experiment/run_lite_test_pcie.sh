@@ -69,6 +69,16 @@ RESULTS_DIR="${RESULTS_DIR:-$PROJECT_ROOT/results/${PREFIX}_qps${QPS}_lead${LEAD
 mkdir -p "$RESULTS_DIR"
 [ -z "$NO_TENSORBOARD" ] && TB_DIR="$RESULTS_DIR/tensorboard" || TB_DIR=""
 
+# 实时将 vLLM 日志写入本结果目录
+VLLM_TAIL_PID=""
+if [ -f "${VLLM_LOG:-}" ]; then
+  tail -f "$VLLM_LOG" >> "$RESULTS_DIR/vllm_live.log" 2>/dev/null &
+  VLLM_TAIL_PID=$!
+  trap '[ -n "${VLLM_TAIL_PID:-}" ] && kill $VLLM_TAIL_PID 2>/dev/null || true' EXIT
+fi
+# 写入完整配置到结果目录
+bash "$SCRIPT_DIR/dump_config.sh" > "$RESULTS_DIR/config.env" 2>/dev/null || true
+
 TOTAL_REQUESTS=$(python3 -c "
 import json
 n=0
@@ -250,6 +260,7 @@ python3 "$PROJECT_ROOT/result-analysis/write_experiment_meta.py" \
 
 [ -f "$VLLM_LOG" ] && cp "$VLLM_LOG" "$RESULTS_DIR/vllm_state.log" 2>/dev/null || true
 [ -d "$PCIE_PROFILER_DIR" ] && cp -r "$PCIE_PROFILER_DIR" "$RESULTS_DIR/profiler_output" 2>/dev/null || true
+[ -n "${VLLM_TAIL_PID:-}" ] && kill $VLLM_TAIL_PID 2>/dev/null || true
 
 echo ""
 echo "============================================"

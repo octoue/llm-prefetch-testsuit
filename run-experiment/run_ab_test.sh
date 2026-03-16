@@ -25,6 +25,16 @@ set -a && source "$SCRIPT_DIR/config.env" && set +a
 RESULTS_DIR="$PROJECT_ROOT/results/$(date +%Y%m%d_%H%M%S)_qps${QPS}"
 mkdir -p "$RESULTS_DIR"
 
+# 实时将 vLLM 日志写入本结果目录
+VLLM_TAIL_PID=""
+if [ -f "${VLLM_LOG:-}" ]; then
+  tail -f "$VLLM_LOG" >> "$RESULTS_DIR/vllm_live.log" 2>/dev/null &
+  VLLM_TAIL_PID=$!
+  trap '[ -n "${VLLM_TAIL_PID:-}" ] && kill $VLLM_TAIL_PID 2>/dev/null || true' EXIT
+fi
+# 写入完整配置到结果目录
+bash "$SCRIPT_DIR/dump_config.sh" > "$RESULTS_DIR/config.env" 2>/dev/null || true
+
 echo "============================================"
 echo "Prefetch A/B 实验"
 echo "============================================"
@@ -105,8 +115,9 @@ python3 -u "$PROJECT_ROOT/result-analysis/generate_report.py" \
   --vllm-config "MODEL_PATH=$MODEL_PATH, VLLM_LOG=$VLLM_LOG, KV_OFFLOADING_SIZE=$KV_OFFLOADING_SIZE, GPU_MEMORY_UTILIZATION=$GPU_MEMORY_UTILIZATION, NUM_GPU_BLOCKS_OVERRIDE=$NUM_GPU_BLOCKS_OVERRIDE, SWAP_SPACE=$SWAP_SPACE" \
   --test-config "TRACE=$TRACE, TIMEOUT=$TIMEOUT, API_BASE=$API_BASE"
 
-# 复制 vLLM 日志到结果目录
+# 复制 vLLM 日志到结果目录（完整快照，vllm_live.log 为实时追加）
 [ -f "$VLLM_LOG" ] && cp "$VLLM_LOG" "$RESULTS_DIR/vllm_state.log" 2>/dev/null || true
+[ -n "${VLLM_TAIL_PID:-}" ] && kill $VLLM_TAIL_PID 2>/dev/null || true
 
 echo ""
 echo "============================================"
