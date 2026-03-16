@@ -61,8 +61,7 @@ CMD_ARGS=(
   --enable-prompt-tokens-details
   --trust-remote-code
   --disable-hybrid-kv-cache-manager
-  --gpu-profiler torch
-  --torch-profiler-dir "$PCIE_PROFILER_DIR"
+  --profiler-config "{\"profiler\": \"torch\", \"torch_profiler_dir\": \"$PCIE_PROFILER_DIR\"}"
 )
 
 if [ -n "$NUM_GPU_BLOCKS_OVERRIDE" ] && [ "$NUM_GPU_BLOCKS_OVERRIDE" != "auto" ]; then
