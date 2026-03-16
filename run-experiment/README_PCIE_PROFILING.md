@@ -41,11 +41,10 @@ cd run-experiment
 
 ### 2b. 中等重度单次测试（仅 Prefetch）
 
-使用 max_input_length=2500 数据，需先以 `NUM_GPU_BLOCKS_OVERRIDE=600~800` 启动 vLLM：
+使用 max_input_length=2500 数据，与 heavy 共用 `NUM_GPU_BLOCKS_OVERRIDE`（在 config.env 中统一配置）：
 
 ```bash
-./start_vllm_pcie.sh medium   # 使用 MEDIUM_NUM_GPU_BLOCKS_OVERRIDE=700
-# 或: NUM_GPU_BLOCKS_OVERRIDE=700 ./start_vllm_pcie.sh
+./start_vllm_pcie.sh medium
 ```
 
 另开终端：
@@ -68,7 +67,7 @@ cd run-experiment
 | `VLLM_SRC` | vLLM 源码路径，默认 `../../vllm` |
 | `PCIE_PROFILER_DIR` | Profiler 输出目录，默认 `./profiler_output` |
 
-其余参数与 `run_lite_test.sh` 相同（LITE_QPS、LITE_NUM_CONV、LITE_TRACE 等）。
+其余参数与 `run_lite_test.sh` 相同（QPS、LITE_NUM_CONV、LITE_TRACE 等）。vLLM 参数（含 `NUM_GPU_BLOCKS_OVERRIDE`）在 config.env 中统一配置，heavy/medium 共用。
 
 ## 单卡说明
 

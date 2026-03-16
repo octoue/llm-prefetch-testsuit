@@ -21,7 +21,7 @@ set -a && source "$SCRIPT_DIR/config.env" && set +a
 [[ "$PCIE_PROFILER_DIR" != /* ]] && PCIE_PROFILER_DIR="$SCRIPT_DIR/$PCIE_PROFILER_DIR"
 
 # 解析命令行参数
-QPS="$LITE_QPS"
+QPS="${LITE_QPS:-$QPS}"
 NO_TENSORBOARD=""
 PREFETCH_ONLY=""
 for arg in "$@"; do
@@ -34,26 +34,25 @@ for arg in "$@"; do
   fi
 done
 
-# PCIe 路径优先使用 heavy-lite 参数
+# PCIe 路径优先使用 heavy-lite 参数（FULL_TRACE 需在 TRACE 覆盖前设置，用于数据集生成源）
+FULL_TRACE="${LITE_FULL_TRACE:-$TRACE}"
 NUM_CONV="${LITE_PCIE_NUM_CONV:-$LITE_NUM_CONV}"
 TIMEOUT="$LITE_TIMEOUT"
 TRACE="${LITE_PCIE_TRACE:-$LITE_TRACE}"
 LEAD_TIME="${LITE_PCIE_PREFETCH_LEAD_TIME:-$PREFETCH_LEAD_TIME}"
-LEAD_TIME="${LEAD_TIME:-3.0}"
-SCHEDULE_MODE="${LITE_PCIE_SCHEDULE_MODE:-uniform}"
-FULL_TRACE="$LITE_FULL_TRACE"
+SCHEDULE_MODE="$LITE_PCIE_SCHEDULE_MODE"
 [[ "$TRACE" != /* ]] && TRACE="$PROJECT_ROOT/$TRACE"
 [[ "$FULL_TRACE" != /* ]] && FULL_TRACE="$PROJECT_ROOT/$FULL_TRACE"
 [[ "$VLLM_LOG" != /* ]] && VLLM_LOG="$SCRIPT_DIR/$VLLM_LOG"
-MAX_INP="${LITE_PCIE_MAX_INPUT_LENGTH:-4000}"
+MAX_INP="$LITE_PCIE_MAX_INPUT_LENGTH"
 
 # 若数据集不存在，先生成（PCIe 路径使用 heavy-lite 参数）
 if [ ! -f "$TRACE" ]; then
   echo "生成数据集: $TRACE"
-  SHORT="${LITE_PCIE_TIER_SHORT:-2}"
-  MEDIUM="${LITE_PCIE_TIER_MEDIUM:-6}"
-  LONG="${LITE_PCIE_TIER_LONG:-8}"
-  SAMPLING="${LITE_PCIE_SAMPLING_MODE:-heavy}"
+  SHORT="$LITE_PCIE_TIER_SHORT"
+  MEDIUM="$LITE_PCIE_TIER_MEDIUM"
+  LONG="$LITE_PCIE_TIER_LONG"
+  SAMPLING="$LITE_PCIE_SAMPLING_MODE"
   python3 "$PROJECT_ROOT/data/prepare_lite_dataset.py" \
     --trace-file "$FULL_TRACE" \
     --output "$TRACE" \

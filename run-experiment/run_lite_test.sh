@@ -3,7 +3,7 @@
 # 轻量化 Prefetch A/B 测试（对应 test.sh 的替代链路）
 #
 # 用法: ./run_lite_test.sh [qps] [--no-tensorboard]
-#   qps 可选，不传则用 config.env 的 LITE_QPS
+#   qps 可选，不传则用 config.env 的 QPS
 #   --no-tensorboard  可选，加上则禁用 TensorBoard（默认启用）
 #
 # 参数来自 config.env（使用 LITE_* 配置项）
@@ -22,7 +22,7 @@ cd "$SCRIPT_DIR"
 set -a && source "$SCRIPT_DIR/config.env" && set +a
 
 # 解析命令行参数：qps 和 --no-tensorboard
-QPS="$LITE_QPS"
+QPS="${LITE_QPS:-$QPS}"
 NO_TENSORBOARD=""
 for arg in "$@"; do
   if [ "$arg" = "--no-tensorboard" ]; then
@@ -34,7 +34,7 @@ done
 NUM_CONV="$LITE_NUM_CONV"
 TIMEOUT="$LITE_TIMEOUT"
 TRACE="$LITE_TRACE"
-FULL_TRACE="$LITE_FULL_TRACE"
+FULL_TRACE="${LITE_FULL_TRACE:-$TRACE}"
 [[ "$TRACE" != /* ]] && TRACE="$PROJECT_ROOT/$TRACE"
 [[ "$FULL_TRACE" != /* ]] && FULL_TRACE="$PROJECT_ROOT/$FULL_TRACE"
 [[ "$VLLM_LOG" != /* ]] && VLLM_LOG="$SCRIPT_DIR/$VLLM_LOG"
