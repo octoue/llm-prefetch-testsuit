@@ -30,16 +30,20 @@ fi
 # 启用 PCIeTracer 事件采集
 export VLLM_PCIE_TRACE=1
 
-# 自动选择显存最空闲的 1 张 GPU
+# PP 卡数（默认 2）
+PP_SIZE="${VLLM_PIPELINE_PARALLEL_SIZE:-2}"
+NUM_GPUS=$PP_SIZE
+
+# 自动选择显存最空闲的 N 张 GPU（N = PP_SIZE）
 FREE_GPUS=$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2>/dev/null | \
-  sort -t',' -k2 -rn | head -n 1 | cut -d',' -f1 | tr -d ' ')
+  sort -t',' -k2 -rn | head -n "$NUM_GPUS" | cut -d',' -f1 | tr -d ' ' | paste -sd ',' -)
 if [ -z "$FREE_GPUS" ]; then
-  echo "Warning: nvidia-smi failed, using CUDA_VISIBLE_DEVICES=0"
-  FREE_GPUS=0
+  echo "Warning: nvidia-smi failed, using CUDA_VISIBLE_DEVICES=0,1"
+  FREE_GPUS="0,1"
 fi
 
 echo "============================================"
-echo "PCIe Profiling 模式启动 vLLM"
+echo "PCIe Profiling 模式启动 vLLM (PP=$PP_SIZE)"
 echo "============================================"
 echo "Selected GPU(s): $FREE_GPUS"
 echo "Model: $MODEL_PATH (local, HF_HUB_OFFLINE=1)"
@@ -48,7 +52,7 @@ echo "Profiler 输出: $PCIE_PROFILER_DIR"
 echo "VLLM_PCIE_TRACE=1, NCCL_P2P_DISABLE=1"
 echo "============================================"
 
-# 构建启动参数（与 start_vllm.sh 一致，额外增加 profiler）
+# 构建启动参数（与 start_vllm.sh 一致，额外增加 profiler 和 PP）
 CMD_ARGS=(
   --model "$MODEL_PATH"
   --host "$VLLM_HOST"
@@ -56,6 +60,7 @@ CMD_ARGS=(
   --max-num-seqs "$VLLM_MAX_NUM_SEQS"
   --block-size "$VLLM_BLOCK_SIZE"
   --tensor-parallel-size "$VLLM_TENSOR_PARALLEL_SIZE"
+  --pipeline-parallel-size "$PP_SIZE"
   --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
   --enable-prefix-caching
   --enable-prompt-tokens-details
