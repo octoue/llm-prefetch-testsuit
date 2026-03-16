@@ -41,15 +41,15 @@ FULL_TRACE="$LITE_FULL_TRACE"
 [[ "$TRACE" != /* ]] && TRACE="$PROJECT_ROOT/$TRACE"
 [[ "$FULL_TRACE" != /* ]] && FULL_TRACE="$PROJECT_ROOT/$FULL_TRACE"
 [[ "$VLLM_LOG" != /* ]] && VLLM_LOG="$SCRIPT_DIR/$VLLM_LOG"
+MAX_INP="${LITE_PCIE_MAX_INPUT_LENGTH:-4000}"
 
 # 若数据集不存在，先生成（PCIe 路径使用 heavy-lite 参数）
 if [ ! -f "$TRACE" ]; then
   echo "生成数据集: $TRACE"
-  MAX_INP="${LITE_PCIE_MAX_INPUT_LENGTH:-3000}"
-  SHORT="${LITE_PCIE_TIER_SHORT:-3}"
-  MEDIUM="${LITE_PCIE_TIER_MEDIUM:-8}"
-  LONG="${LITE_PCIE_TIER_LONG:-7}"
-  SAMPLING="${LITE_PCIE_SAMPLING_MODE:-default}"
+  SHORT="${LITE_PCIE_TIER_SHORT:-2}"
+  MEDIUM="${LITE_PCIE_TIER_MEDIUM:-6}"
+  LONG="${LITE_PCIE_TIER_LONG:-8}"
+  SAMPLING="${LITE_PCIE_SAMPLING_MODE:-heavy}"
   python3 "$PROJECT_ROOT/data/prepare_lite_dataset.py" \
     --trace-file "$FULL_TRACE" \
     --output "$TRACE" \
@@ -59,7 +59,8 @@ if [ ! -f "$TRACE" ]; then
     --seed "$SEED"
 fi
 
-RESULTS_DIR="$PROJECT_ROOT/results/lite_qps${QPS}_pcie"
+# heavy-lite 实验使用 heavy_lite_xxx 目录命名
+RESULTS_DIR="${RESULTS_DIR:-$PROJECT_ROOT/results/heavy_lite_qps${QPS}_lead${LEAD_TIME}_max${MAX_INP}}"
 mkdir -p "$RESULTS_DIR"
 [ -z "$NO_TENSORBOARD" ] && TB_DIR="$RESULTS_DIR/tensorboard" || TB_DIR=""
 

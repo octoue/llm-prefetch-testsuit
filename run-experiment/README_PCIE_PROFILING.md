@@ -40,10 +40,10 @@ cd run-experiment
 
 ### 3. 查看结果
 
-- **报告**：`results/lite_qps{X}_pcie/report.md`
-- **PCIe 甘特图**：`results/lite_qps{X}_pcie/pcie_gantt.html`（用浏览器打开）
-- **原始事件**：`results/lite_qps{X}_pcie/pcie_events_0.json`
-- **Profiler 输出**：`results/lite_qps{X}_pcie/profiler_output/`（含 trace.json）
+- **报告**：`results/heavy_lite_qps{X}_lead{Y}_max{Z}/report.md`
+- **PCIe 甘特图**：`results/heavy_lite_qps{X}_lead{Y}_max{Z}/pcie_gantt.html`（用浏览器打开）
+- **原始事件**：`results/heavy_lite_qps{X}_lead{Y}_max{Z}/pcie_events_0.json`
+- **Profiler 输出**：`results/heavy_lite_qps{X}_lead{Y}_max{Z}/profiler_output/`（含 trace.json）
 
 ## 配置 (config.env)
 
