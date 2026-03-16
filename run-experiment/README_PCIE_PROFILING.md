@@ -31,12 +31,28 @@ cd run-experiment
 ./run_lite_test_pcie.sh
 # 或指定 QPS: ./run_lite_test_pcie.sh 0.4
 # 禁用 TensorBoard: ./run_lite_test_pcie.sh 0.4 --no-tensorboard
+# 仅 Prefetch（跳过 Baseline）: ./run_lite_test_pcie.sh 0.4 --prefetch-only
 ```
 
 流程：
 - Phase 1：调用 `/start_profile`，运行 Prefetch 模式，结束后 `/stop_profile`
-- Phase 2：运行 Baseline 模式（无 profiling）
-- Phase 3：生成 report.md 和 `pcie_gantt.html`
+- Phase 2：运行 Baseline 模式（无 profiling），`--prefetch-only` 时跳过
+- Phase 3：生成 report.md 和 `pcie_gantt.html`（prefetch-only 时跳过 report）
+
+### 2b. 中等重度单次测试（仅 Prefetch）
+
+使用 max_input_length=2500 数据，需先以 `NUM_GPU_BLOCKS_OVERRIDE=600~800` 启动 vLLM：
+
+```bash
+./start_vllm_pcie.sh medium   # 使用 MEDIUM_NUM_GPU_BLOCKS_OVERRIDE=700
+# 或: NUM_GPU_BLOCKS_OVERRIDE=700 ./start_vllm_pcie.sh
+```
+
+另开终端：
+
+```bash
+./run_lite_test_pcie_medium.sh 0.6 --no-tensorboard
+```
 
 ### 3. 查看结果
 

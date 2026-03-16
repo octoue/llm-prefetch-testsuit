@@ -1,7 +1,8 @@
 #!/bin/bash
 # vLLM 启动脚本（PCIe Profiling 版）
 # 在 start_vllm.sh 基础上增加：禁用 NVLink、轻量 PCIe Profiler（仅 PCIeTracer，无 torch 开销）
-# 用法: ./start_vllm_pcie.sh
+# 用法: ./start_vllm_pcie.sh [medium]
+#   medium: 使用 MEDIUM_NUM_GPU_BLOCKS_OVERRIDE (600~800)，配合中等重度数据 max_input=2500
 # 配合 run_lite_test_pcie.sh 使用，采集 KV Offload / Prefetch 的 PCIe 带宽数据
 
 set -e
@@ -11,6 +12,12 @@ cd "$SCRIPT_DIR"
 
 [ -f "$SCRIPT_DIR/config.env" ] || { echo "错误: 缺少 config.env"; exit 1; }
 set -a && source "$SCRIPT_DIR/config.env" && set +a
+
+# 中等重度模式：使用更大的 GPU blocks
+if [ "${1:-}" = "medium" ]; then
+  export NUM_GPU_BLOCKS_OVERRIDE="${MEDIUM_NUM_GPU_BLOCKS_OVERRIDE:-700}"
+  echo "中等重度模式: NUM_GPU_BLOCKS_OVERRIDE=$NUM_GPU_BLOCKS_OVERRIDE"
+fi
 
 [[ "$VLLM_LOG" != /* ]] && VLLM_LOG="$SCRIPT_DIR/$VLLM_LOG"
 [[ "$VLLM_SRC" != /* ]] && VLLM_SRC="$SCRIPT_DIR/$VLLM_SRC"

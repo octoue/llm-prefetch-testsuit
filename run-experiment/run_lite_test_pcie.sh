@@ -3,7 +3,8 @@
 # 轻量化 Prefetch A/B 测试 + PCIe Profiling
 # 在 run_lite_test.sh 基础上：在 Phase 1 (Prefetch) 期间触发 profiler，采集后生成甘特图
 #
-# 用法: ./run_lite_test_pcie.sh [qps] [--no-tensorboard]
+# 用法: ./run_lite_test_pcie.sh [qps] [--no-tensorboard] [--prefetch-only]
+#   --prefetch-only: 仅跑 Prefetch 阶段收集 PCIe trace，跳过 Baseline 和 A/B 报告
 # 前提: 使用 start_vllm_pcie.sh 启动 vLLM（而非 start_vllm.sh）
 #
 
@@ -22,9 +23,12 @@ set -a && source "$SCRIPT_DIR/config.env" && set +a
 # 解析命令行参数
 QPS="$LITE_QPS"
 NO_TENSORBOARD=""
+PREFETCH_ONLY=""
 for arg in "$@"; do
   if [ "$arg" = "--no-tensorboard" ]; then
     NO_TENSORBOARD=1
+  elif [ "$arg" = "--prefetch-only" ]; then
+    PREFETCH_ONLY=1
   elif [[ "$arg" =~ ^[0-9.]+$ ]]; then
     QPS="$arg"
   fi
@@ -59,8 +63,9 @@ if [ ! -f "$TRACE" ]; then
     --seed "$SEED"
 fi
 
-# heavy-lite 实验使用 heavy_lite_xxx 目录命名
-RESULTS_DIR="${RESULTS_DIR:-$PROJECT_ROOT/results/heavy_lite_qps${QPS}_lead${LEAD_TIME}_max${MAX_INP}}"
+# 结果目录：RESULTS_PREFIX=medium_lite 时用 medium_lite_xxx，否则 heavy_lite_xxx
+PREFIX="${RESULTS_PREFIX:-heavy_lite}"
+RESULTS_DIR="${RESULTS_DIR:-$PROJECT_ROOT/results/${PREFIX}_qps${QPS}_lead${LEAD_TIME}_max${MAX_INP}}"
 mkdir -p "$RESULTS_DIR"
 [ -z "$NO_TENSORBOARD" ] && TB_DIR="$RESULTS_DIR/tensorboard" || TB_DIR=""
 
@@ -136,49 +141,54 @@ echo ""
 echo "等待 60 秒让 server 冷却..."
 sleep 60
 
-# 清空 prefix cache
-echo ""
-echo "清空 prefix cache 和 connector cache..."
-curl -s -X POST "http://${API_HOST}/reset_prefix_cache?reset_external=true" || true
-sleep 5
+# Phase 2: Baseline（无 profiling），--prefetch-only 时跳过
+if [ -z "$PREFETCH_ONLY" ]; then
+  echo ""
+  echo "清空 prefix cache 和 connector cache..."
+  curl -s -X POST "http://${API_HOST}/reset_prefix_cache?reset_external=true" || true
+  sleep 5
 
-# Phase 2: Baseline（无 profiling）
-TB_BASELINE_ARGS=()
-[ -n "$TB_DIR" ] && TB_BASELINE_ARGS=(--tensorboard-dir "${TB_DIR}/baseline")
+  TB_BASELINE_ARGS=()
+  [ -n "$TB_DIR" ] && TB_BASELINE_ARGS=(--tensorboard-dir "${TB_DIR}/baseline")
 
-echo ""
-echo "[Phase 2] 运行 Baseline (无 prefetch)..."
-python3 -u "$SCRIPT_DIR/prefetch_ab_runner.py" \
-  --trace-file "$TRACE" \
-  --mode baseline \
-  --qps "$QPS" \
-  --num-multi-turn "$NUM_CONV" \
-  --model "$MODEL_PATH" \
-  --api-base "$API_BASE" \
-  --output "$RESULTS_DIR/baseline.jsonl" \
-  --seed "$SEED" \
-  --timeout "$TIMEOUT" \
-  --request-timeout "$REQUEST_TIMEOUT" \
-  --schedule-mode "$SCHEDULE_MODE" \
-  "${TB_BASELINE_ARGS[@]}" \
-  &> "$RESULTS_DIR/baseline.log"
+  echo ""
+  echo "[Phase 2] 运行 Baseline (无 prefetch)..."
+  python3 -u "$SCRIPT_DIR/prefetch_ab_runner.py" \
+    --trace-file "$TRACE" \
+    --mode baseline \
+    --qps "$QPS" \
+    --num-multi-turn "$NUM_CONV" \
+    --model "$MODEL_PATH" \
+    --api-base "$API_BASE" \
+    --output "$RESULTS_DIR/baseline.jsonl" \
+    --seed "$SEED" \
+    --timeout "$TIMEOUT" \
+    --request-timeout "$REQUEST_TIMEOUT" \
+    --schedule-mode "$SCHEDULE_MODE" \
+    "${TB_BASELINE_ARGS[@]}" \
+    &> "$RESULTS_DIR/baseline.log"
 
-grep "Avg prompt throughput" "$VLLM_LOG" >> "$RESULTS_DIR/baseline.log" 2>/dev/null || true
+  grep "Avg prompt throughput" "$VLLM_LOG" >> "$RESULTS_DIR/baseline.log" 2>/dev/null || true
+fi
 
-# Phase 3: 生成报告 + PCIe 甘特图
+# Phase 3: 生成报告 + PCIe 甘特图（prefetch-only 时跳过报告）
 echo ""
 echo "[Phase 3] 生成报告与 PCIe 甘特图..."
 
 CONFIG_STR="QPS=$QPS, NUM_CONV=$NUM_CONV, SEED=$SEED, LITE=1, PCIE_PROFILING=1, PP=$PP_SIZE, SCHEDULE=$SCHEDULE_MODE, LEAD_TIME=$LEAD_TIME"
 [ -n "$KV_OFFLOADING_SIZE" ] && CONFIG_STR="$CONFIG_STR, KV_OFFLOADING_SIZE=$KV_OFFLOADING_SIZE"
 
-python3 -u "$PROJECT_ROOT/result-analysis/generate_report.py" \
-  --baseline "$RESULTS_DIR/baseline.jsonl" \
-  --prefetch "$RESULTS_DIR/prefetch.jsonl" \
-  --output "$RESULTS_DIR/report.md" \
-  --config "$CONFIG_STR" \
-  --vllm-config "MODEL_PATH=$MODEL_PATH, VLLM_LOG=$VLLM_LOG, KV_OFFLOADING_SIZE=$KV_OFFLOADING_SIZE, GPU_MEMORY_UTILIZATION=$GPU_MEMORY_UTILIZATION, NUM_GPU_BLOCKS_OVERRIDE=$NUM_GPU_BLOCKS_OVERRIDE, SWAP_SPACE=$SWAP_SPACE" \
-  --test-config "TRACE=$TRACE, FULL_TRACE=$FULL_TRACE, TIMEOUT=$TIMEOUT, REQUEST_TIMEOUT=$REQUEST_TIMEOUT, API_BASE=$API_BASE"
+if [ -z "$PREFETCH_ONLY" ] && [ -f "$RESULTS_DIR/baseline.jsonl" ]; then
+  python3 -u "$PROJECT_ROOT/result-analysis/generate_report.py" \
+    --baseline "$RESULTS_DIR/baseline.jsonl" \
+    --prefetch "$RESULTS_DIR/prefetch.jsonl" \
+    --output "$RESULTS_DIR/report.md" \
+    --config "$CONFIG_STR" \
+    --vllm-config "MODEL_PATH=$MODEL_PATH, VLLM_LOG=$VLLM_LOG, KV_OFFLOADING_SIZE=$KV_OFFLOADING_SIZE, GPU_MEMORY_UTILIZATION=$GPU_MEMORY_UTILIZATION, NUM_GPU_BLOCKS_OVERRIDE=$NUM_GPU_BLOCKS_OVERRIDE, SWAP_SPACE=$SWAP_SPACE" \
+    --test-config "TRACE=$TRACE, FULL_TRACE=$FULL_TRACE, TIMEOUT=$TIMEOUT, REQUEST_TIMEOUT=$REQUEST_TIMEOUT, API_BASE=$API_BASE"
+else
+  echo "（prefetch-only 模式，跳过 A/B 报告生成）"
+fi
 
 # 生成 PCIe 甘特图（单卡为 pcie_events_0.json，多卡 PP 时合并 pcie_events_*.json）
 PCIE_MERGED="$RESULTS_DIR/pcie_events_merged.json"
