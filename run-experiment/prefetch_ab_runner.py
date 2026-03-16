@@ -215,18 +215,44 @@ class PrefetchABRunner:
             workload.append(("multi", chain))
         return workload
 
-    def _schedule_requests(self, workload: List[Tuple[str, List[Dict]]], qps: float) -> Tuple[List, Dict]:
-        """返回 (workload, scheduled_map)，scheduled_map[(chat_id,turn)] = 绝对时间戳"""
+    def _schedule_requests(
+        self,
+        workload: List[Tuple[str, List[Dict]]],
+        qps: float,
+        schedule_mode: str = "uniform",
+    ) -> Tuple[List, Dict]:
+        """返回 (workload, scheduled_map)，scheduled_map[(chat_id,turn)] = 相对时间戳（秒）
+
+        schedule_mode:
+          - uniform: 均匀排程，间隔 1/qps
+          - scaled-timestamp: 按原始 timestamp 等比例缩放，保留 burst 结构
+        """
         all_reqs = []
         for conv_idx, (conv_type, chain) in enumerate(workload):
             for req_idx, record in enumerate(chain):
                 all_reqs.append({"conv_idx": conv_idx, "req_idx": req_idx, "record": record})
         all_reqs.sort(key=lambda x: x["record"]["timestamp"])
+
+        if schedule_mode == "scaled-timestamp":
+            # 按原始时间戳等比例缩放，保留 burst 结构
+            timestamps = [r["record"]["timestamp"] for r in all_reqs]
+            t_min, t_max = min(timestamps), max(timestamps)
+            orig_dur = t_max - t_min if t_max > t_min else 1.0
+            tgt_dur = len(all_reqs) / qps
+            scale = tgt_dur / orig_dur
+            scheduled_map = {}
+            for req in all_reqs:
+                r = req["record"]
+                rel = (r["timestamp"] - t_min) * scale
+                scheduled_map[(r["chat_id"], r["turn"])] = rel
+            return workload, scheduled_map
+
+        # uniform
         interval = 1.0 / qps
         scheduled_map = {}
         for i, req in enumerate(all_reqs):
             r = req["record"]
-            scheduled_map[(r["chat_id"], r["turn"])] = i * interval  # 相对时间
+            scheduled_map[(r["chat_id"], r["turn"])] = i * interval
         return workload, scheduled_map
 
     async def _send_prefetch(
@@ -461,13 +487,16 @@ class PrefetchABRunner:
         output: str,
         max_turns: Optional[int] = None,
         timeout: Optional[float] = None,
+        schedule_mode: str = "uniform",
     ):
         workload = self._sample_workload(num_multi_turn, max_turns)
         if not workload:
             print("无 workload")
             return
 
-        scheduled_workload, scheduled_map_rel = self._schedule_requests(workload, qps)
+        scheduled_workload, scheduled_map_rel = self._schedule_requests(
+            workload, qps, schedule_mode=schedule_mode
+        )
 
         self.test_start_time = time.time()
         self.timeout = timeout
@@ -547,6 +576,8 @@ async def main():
     parser.add_argument("--max-turns", type=int, default=None)
     parser.add_argument("--output", required=True, help="输出 JSONL 路径")
     parser.add_argument("--prefetch-lead-time", type=float, default=0.2, help="Prefetch 提前量（秒），在 scheduled_time - lead_time 发送 prefetch")
+    parser.add_argument("--schedule-mode", choices=["uniform", "scaled-timestamp"], default="uniform",
+                        help="uniform=均匀排程; scaled-timestamp=按原始时间戳缩放保留 burst")
     parser.add_argument("--timeout", type=float, default=None, help="测试总超时（秒），超时后不再发送新请求。全量测试不传以跑完所有请求")
     parser.add_argument("--request-timeout", type=float, default=None, help="单请求 HTTP 超时（秒）。仅轻量化测试传入（如 120），全量测试不传以保持 600s 默认")
     parser.add_argument("--tensorboard-dir", type=str, default=None, help="TensorBoard 日志目录，传入时启用实时监控")
@@ -569,6 +600,7 @@ async def main():
         output=args.output,
         max_turns=args.max_turns,
         timeout=args.timeout,
+        schedule_mode=args.schedule_mode,
     )
 
 

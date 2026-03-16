@@ -59,6 +59,16 @@ def get_conversation_chain(root_id: int, chat_dict: Dict, children_dict: Dict) -
     return chain
 
 
+def _heaviness(chain: List[Dict]) -> Tuple[int, int, int]:
+    """(max_input, total_tokens, type_priority) for sorting. Higher = heavier."""
+    max_inp = max(r["input_length"] for r in chain)
+    total = sum(r["input_length"] + r["output_length"] for r in chain)
+    types = set(r.get("type", "text") for r in chain)
+    # search/file tend to have larger prompts; text=0, search=1, file=2
+    type_pri = 2 if "file" in types else (1 if "search" in types else 0)
+    return (max_inp, total, type_pri)
+
+
 def main():
     parser = argparse.ArgumentParser(description="准备轻量化测试数据集")
     parser.add_argument("--trace-file", default="qwen_traceA_blksz_16.jsonl", help="完整 trace JSONL 路径")
@@ -69,6 +79,12 @@ def main():
     parser.add_argument("--max-input-length", type=int, default=None,
                         help="排除对话链中任何一轮 input_length 超过此值的整条链")
     parser.add_argument("--seed", type=int, default=42, help="随机种子，确保每次运行结果相同")
+    parser.add_argument(
+        "--sampling-mode",
+        choices=["default", "heavy"],
+        default="default",
+        help="default=随机抽样; heavy=偏重链优先(max_input/total_tokens/search/file)",
+    )
     args = parser.parse_args()
 
     records, children_dict, chat_dict = load_trace(args.trace_file)
@@ -103,14 +119,17 @@ def main():
 
     random.seed(args.seed)
 
-    def select_n(pool: List, n: int) -> List:
+    def select_n(pool: List, n: int, heavy: bool = False) -> List:
         if len(pool) <= n:
             return pool
+        if heavy:
+            return sorted(pool, key=lambda x: _heaviness(x[1]), reverse=True)[:n]
         return random.sample(pool, n)
 
-    selected_short = select_n(short_convs, args.short)
-    selected_medium = select_n(medium_convs, args.medium)
-    selected_long = select_n(long_convs, args.long)
+    heavy = args.sampling_mode == "heavy"
+    selected_short = select_n(short_convs, args.short, heavy)
+    selected_medium = select_n(medium_convs, args.medium, heavy)
+    selected_long = select_n(long_convs, args.long, heavy)
 
     all_selected = selected_short + selected_medium + selected_long
     if not all_selected:

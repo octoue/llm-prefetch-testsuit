@@ -30,22 +30,32 @@ for arg in "$@"; do
   fi
 done
 
-NUM_CONV="$LITE_NUM_CONV"
+# PCIe 路径优先使用 heavy-lite 参数
+NUM_CONV="${LITE_PCIE_NUM_CONV:-$LITE_NUM_CONV}"
 TIMEOUT="$LITE_TIMEOUT"
-TRACE="$LITE_TRACE"
+TRACE="${LITE_PCIE_TRACE:-$LITE_TRACE}"
+LEAD_TIME="${LITE_PCIE_PREFETCH_LEAD_TIME:-$PREFETCH_LEAD_TIME}"
+LEAD_TIME="${LEAD_TIME:-3.0}"
+SCHEDULE_MODE="${LITE_PCIE_SCHEDULE_MODE:-uniform}"
 FULL_TRACE="$LITE_FULL_TRACE"
 [[ "$TRACE" != /* ]] && TRACE="$PROJECT_ROOT/$TRACE"
 [[ "$FULL_TRACE" != /* ]] && FULL_TRACE="$PROJECT_ROOT/$FULL_TRACE"
 [[ "$VLLM_LOG" != /* ]] && VLLM_LOG="$SCRIPT_DIR/$VLLM_LOG"
 
-# 若 lite_dataset.jsonl 不存在，先生成
+# 若数据集不存在，先生成（PCIe 路径使用 heavy-lite 参数）
 if [ ! -f "$TRACE" ]; then
-  echo "生成轻量化数据集: $TRACE"
+  echo "生成数据集: $TRACE"
+  MAX_INP="${LITE_PCIE_MAX_INPUT_LENGTH:-3000}"
+  SHORT="${LITE_PCIE_TIER_SHORT:-3}"
+  MEDIUM="${LITE_PCIE_TIER_MEDIUM:-8}"
+  LONG="${LITE_PCIE_TIER_LONG:-7}"
+  SAMPLING="${LITE_PCIE_SAMPLING_MODE:-default}"
   python3 "$PROJECT_ROOT/data/prepare_lite_dataset.py" \
     --trace-file "$FULL_TRACE" \
     --output "$TRACE" \
-    --max-input-length 3000 \
-    --short 3 --medium 8 --long 7 \
+    --max-input-length "$MAX_INP" \
+    --short "$SHORT" --medium "$MEDIUM" --long "$LONG" \
+    --sampling-mode "$SAMPLING" \
     --seed "$SEED"
 fi
 
@@ -109,7 +119,8 @@ python3 -u "$SCRIPT_DIR/prefetch_ab_runner.py" \
   --seed "$SEED" \
   --timeout "$TIMEOUT" \
   --request-timeout "$REQUEST_TIMEOUT" \
-  --prefetch-lead-time "${PREFETCH_LEAD_TIME:-3.0}" \
+  --prefetch-lead-time "$LEAD_TIME" \
+  --schedule-mode "$SCHEDULE_MODE" \
   "${TB_PREFETCH_ARGS[@]}" \
   &> "$RESULTS_DIR/prefetch.log"
 
@@ -147,6 +158,7 @@ python3 -u "$SCRIPT_DIR/prefetch_ab_runner.py" \
   --seed "$SEED" \
   --timeout "$TIMEOUT" \
   --request-timeout "$REQUEST_TIMEOUT" \
+  --schedule-mode "$SCHEDULE_MODE" \
   "${TB_BASELINE_ARGS[@]}" \
   &> "$RESULTS_DIR/baseline.log"
 
@@ -156,7 +168,7 @@ grep "Avg prompt throughput" "$VLLM_LOG" >> "$RESULTS_DIR/baseline.log" 2>/dev/n
 echo ""
 echo "[Phase 3] 生成报告与 PCIe 甘特图..."
 
-CONFIG_STR="QPS=$QPS, NUM_CONV=$NUM_CONV, SEED=$SEED, LITE=1, PCIE_PROFILING=1, PP=$PP_SIZE"
+CONFIG_STR="QPS=$QPS, NUM_CONV=$NUM_CONV, SEED=$SEED, LITE=1, PCIE_PROFILING=1, PP=$PP_SIZE, SCHEDULE=$SCHEDULE_MODE, LEAD_TIME=$LEAD_TIME"
 [ -n "$KV_OFFLOADING_SIZE" ] && CONFIG_STR="$CONFIG_STR, KV_OFFLOADING_SIZE=$KV_OFFLOADING_SIZE"
 
 python3 -u "$PROJECT_ROOT/result-analysis/generate_report.py" \
@@ -208,9 +220,22 @@ if [ -f "${PCIE_EVENTS:-}" ]; then
     echo "Warning: visualize_pcie_gantt.py 未找到，跳过甘特图"
   fi
   [ -f "$PCIE_EVENTS" ] && cp "$PCIE_EVENTS" "$RESULTS_DIR/" 2>/dev/null || true
+  if [ -f "$PROJECT_ROOT/result-analysis/summarize_pcie_events.py" ] && [ -f "${PCIE_EVENTS:-}" ]; then
+    echo "PCIe 事件摘要:"
+    python3 "$PROJECT_ROOT/result-analysis/summarize_pcie_events.py" "$PCIE_EVENTS" 2>/dev/null || true
+  fi
 else
   echo "Warning: PCIe 事件文件不存在，请确认 VLLM_PCIE_TRACE=1 且 start_vllm_pcie.sh 已正确启动"
 fi
+
+# 写入实验元数据
+python3 "$PROJECT_ROOT/result-analysis/write_experiment_meta.py" \
+  --output "$RESULTS_DIR/experiment_meta.json" \
+  --qps "$QPS" --num-conv "$NUM_CONV" \
+  --schedule-mode "$SCHEDULE_MODE" --lead-time "$LEAD_TIME" \
+  --trace "$TRACE" --sampling-mode "${LITE_PCIE_SAMPLING_MODE:-default}" \
+  --max-input-length "${LITE_PCIE_MAX_INPUT_LENGTH:-3000}" \
+  2>/dev/null || true
 
 [ -f "$VLLM_LOG" ] && cp "$VLLM_LOG" "$RESULTS_DIR/vllm_state.log" 2>/dev/null || true
 [ -d "$PCIE_PROFILER_DIR" ] && cp -r "$PCIE_PROFILER_DIR" "$RESULTS_DIR/profiler_output" 2>/dev/null || true
