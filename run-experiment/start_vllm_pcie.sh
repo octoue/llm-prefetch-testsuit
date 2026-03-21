@@ -1,19 +1,40 @@
 #!/bin/bash
 # vLLM 启动脚本（PCIe Profiling 版）
 # 在 start_vllm.sh 基础上增加：禁用 NVLink、轻量 PCIe Profiler（仅 PCIeTracer，无 torch 开销）
-# 用法: ./start_vllm_pcie.sh [medium]
-#   medium: 仅提示，与默认共用 NUM_GPU_BLOCKS_OVERRIDE（config.env 中统一配置）
-# 配合 run_lite_test_pcie.sh 使用，采集 KV Offload / Prefetch 的 PCIe 带宽数据
+# 用法: ./start_vllm_pcie.sh [medium|--pcie-scheduler]
+#   medium: 仅提示，与默认共用 NUM_GPU_BLOCKS_OVERRIDE
+#   --pcie-scheduler: 启用 PCIe 调度算法 (VLLM_PCIE_SCHEDULER=1)，用于 A/B 实验 Phase 1
+# 配合 run_pcie_scheduling_ab.sh 使用
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-[ -f "$SCRIPT_DIR/config.env" ] || { echo "错误: 缺少 config.env"; exit 1; }
-set -a && source "$SCRIPT_DIR/config.env" && set +a
+# 解析可选参数
+PCIE_SCHEDULER=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --pcie-scheduler)
+            PCIE_SCHEDULER=1
+            shift ;;
+        medium)
+            shift ;;
+        *)
+            shift ;;
+    esac
+done
 
-[ "${1:-}" = "medium" ] && echo "中等重度模式 (max_input=2500): NUM_GPU_BLOCKS_OVERRIDE=$NUM_GPU_BLOCKS_OVERRIDE"
+# 加载新的配置文件
+[ -f "$SCRIPT_DIR/config/system.env" ] || { echo "错误: 缺少 config/system.env"; exit 1; }
+[ -f "$SCRIPT_DIR/config/experiments.env" ] || { echo "错误: 缺少 config/experiments.env"; exit 1; }
+
+set -a
+source "$SCRIPT_DIR/config/system.env"
+source "$SCRIPT_DIR/config/experiments.env"
+set +a
+
+[[ "$PCIE_SCHEDULER" -eq 1 ]] && export VLLM_PCIE_SCHEDULER=1 && echo "PCIe Scheduler: enabled (VLLM_PCIE_SCHEDULER=1)"
 
 [[ "$VLLM_LOG" != /* ]] && VLLM_LOG="$SCRIPT_DIR/$VLLM_LOG"
 [[ "$VLLM_SRC" != /* ]] && VLLM_SRC="$SCRIPT_DIR/$VLLM_SRC"
@@ -53,6 +74,7 @@ echo "Model: $MODEL_PATH (local, HF_HUB_OFFLINE=1)"
 echo "KV_OFFLOADING_SIZE=${KV_OFFLOADING_SIZE}, SWAP_SPACE=${SWAP_SPACE}"
 echo "Profiler 输出: $PCIE_PROFILER_DIR"
 echo "VLLM_PCIE_TRACE=1, NCCL_P2P_DISABLE=1"
+[[ "$PCIE_SCHEDULER" -eq 1 ]] && echo "VLLM_PCIE_SCHEDULER=1 (PCIe scheduling enabled)"
 echo "============================================"
 
 # 构建启动参数（与 start_vllm.sh 一致，额外增加 profiler 和 PP）

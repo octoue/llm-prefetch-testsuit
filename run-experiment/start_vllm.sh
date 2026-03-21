@@ -9,8 +9,14 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-[ -f "$SCRIPT_DIR/config.env" ] || { echo "错误: 缺少 config.env"; exit 1; }
-set -a && source "$SCRIPT_DIR/config.env" && set +a
+# 加载新的配置文件
+[ -f "$SCRIPT_DIR/config/system.env" ] || { echo "错误: 缺少 config/system.env"; exit 1; }
+[ -f "$SCRIPT_DIR/config/experiments.env" ] || { echo "错误: 缺少 config/experiments.env"; exit 1; }
+
+set -a
+source "$SCRIPT_DIR/config/system.env"
+source "$SCRIPT_DIR/config/experiments.env"
+set +a
 
 [[ "$VLLM_LOG" != /* ]] && VLLM_LOG="$SCRIPT_DIR/$VLLM_LOG"
 

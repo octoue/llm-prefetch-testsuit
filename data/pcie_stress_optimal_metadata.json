@@ -1,0 +1,21 @@
+{
+  "num_conversations": 22,
+  "total_samples": 124,
+  "turns_range": [
+    5,
+    8
+  ],
+  "input_length_max": 2000,
+  "total_tokens_max": 15000,
+  "sampling_mode": "heavy",
+  "seed": 2026,
+  "pcie_pressure": {
+    "peak_blocks_needed": 11504,
+    "gpu_blocks_configured": 500,
+    "pressure_ratio": 23.008,
+    "h2d_operations": 124,
+    "d2h_operations": 21,
+    "num_conversations": 22,
+    "total_turns": 124
+  }
+}
