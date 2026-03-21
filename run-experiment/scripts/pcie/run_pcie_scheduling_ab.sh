@@ -204,11 +204,38 @@ fi
 # ------------------------------------------------------------------
 print_phase "[Phase 3/3] Generating comparison report..."
 
-# 使用 generate_report 做 TTFT/TPOT 对比
+# 先保存完整配置快照（供报告和 generate_report 使用）
+{
+    echo "# PCIe Scheduling A/B Experiment - 完整配置快照"
+    echo ""
+    echo "# ========== 实验运行时参数 =========="
+    echo "DATASET=$DATASET"
+    echo "QPS=$QPS"
+    echo "PREFETCH_LEAD_TIME=$PREFETCH_LEAD_TIME"
+    echo "NUM_GPU_BLOCKS_OVERRIDE=$NUM_GPU_BLOCKS_OVERRIDE"
+    echo "TRACE=$TRACE"
+    echo "FULL_TRACE=$FULL_TRACE"
+    echo "NUM_CONV=$NUM_CONV"
+    echo "MODEL_PATH=$MODEL_PATH"
+    echo ""
+    echo "# ========== system.env =========="
+    cat config/system.env 2>/dev/null || true
+    echo ""
+    echo "# ========== experiments.env =========="
+    cat config/experiments.env 2>/dev/null || true
+    echo ""
+    echo "# ========== datasets.env (当前数据集: $DATASET) =========="
+    DS_PREFIX="DATASET_$(echo ${DATASET//-/_} | tr '[:lower:]' '[:upper:]')_"
+    grep -E "^DATA_ROOT=|^${DS_PREFIX}" config/datasets.env 2>/dev/null || cat config/datasets.env 2>/dev/null || true
+} > "$RESULTS_DIR/config_snapshot.env"
+bash dump_config.sh >> "$RESULTS_DIR/config_snapshot.env" 2>/dev/null || true
+
+# 使用 generate_report 做 TTFT/TPOT 对比（传入配置文件以修复配置详情为空）
 python3 ../result-analysis/generate_report.py \
     --baseline "$RESULTS_DIR/prefetch_baseline.jsonl" \
     --prefetch "$RESULTS_DIR/prefetch_pcie_sched.jsonl" \
     --output "$RESULTS_DIR/ttft_report.md" \
+    --config-file "$RESULTS_DIR/config_snapshot.env" \
     2>/dev/null && echo "✓ TTFT report: $RESULTS_DIR/ttft_report.md" || true
 
 # 使用 PCIe 调度专用报告生成器（含 config、PCIe 带宽等）
@@ -224,17 +251,6 @@ if [[ -f "../result-analysis/generate_pcie_scheduling_report.py" ]]; then
 else
     echo "⚠️  generate_pcie_scheduling_report.py not found, skipping enhanced report"
 fi
-
-# 保存配置快照
-{
-    echo "# PCIe Scheduling A/B Experiment Config"
-    echo "DATASET=$DATASET"
-    echo "QPS=$QPS"
-    echo "PREFETCH_LEAD_TIME=$PREFETCH_LEAD_TIME"
-    echo "NUM_GPU_BLOCKS_OVERRIDE=$NUM_GPU_BLOCKS_OVERRIDE"
-    echo "TRACE=$TRACE"
-} > "$RESULTS_DIR/config_snapshot.env"
-bash dump_config.sh >> "$RESULTS_DIR/config_snapshot.env" 2>/dev/null || true
 
 echo ""
 echo "✅ PCIe Scheduling A/B experiment complete!"

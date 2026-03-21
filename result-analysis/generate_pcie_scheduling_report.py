@@ -144,23 +144,57 @@ def main() -> None:
     cached_sched = cached_stats(pcie_sched)
     cached_base = cached_stats(baseline)
 
+    # 按类别分组配置，便于阅读
+    def group_config(cfg: dict[str, str]) -> dict[str, list[tuple[str, str]]]:
+        groups: dict[str, list[tuple[str, str]]] = {
+            "系统/vLLM": [],
+            "实验": [],
+            "数据集": [],
+            "其他": [],
+        }
+        for k, v in sorted(cfg.items()):
+            if not k or not v:
+                continue
+            if k.startswith(("MODEL_", "GPU_", "VLLM_", "KV_", "SWAP_", "API_", "PCIE_", "NUM_GPU_BLOCKS")):
+                groups["系统/vLLM"].append((k, v))
+            elif k.startswith(("QPS", "SEED", "PREFETCH_", "SCHEDULE_", "TIMEOUT", "REQUEST_", "TB_", "ENABLE_", "RESULTS_")):
+                groups["实验"].append((k, v))
+            elif k.startswith(("DATASET", "TRACE", "FULL_TRACE", "NUM_CONV", "MAX_INPUT", "DATA_ROOT")):
+                groups["数据集"].append((k, v))
+            else:
+                groups["其他"].append((k, v))
+        return groups
+
+    cfg_groups = group_config(config)
+
     # Build report
     lines = [
         "# PCIe Scheduling A/B 实验报告",
         "",
         "## 1. 配置快照",
         "",
-        "| 参数 | 值 |",
-        "|------|-----|",
     ]
-    for k, v in sorted(config.items()):
-        if k and v:
-            lines.append(f"| {k} | {v} |")
+    for group_name, items in cfg_groups.items():
+        if items:
+            lines.append(f"### {group_name}")
+            lines.append("")
+            lines.append("| 参数 | 值 |")
+            lines.append("|------|-----|")
+            for k, v in items:
+                lines.append(f"| {k} | {v} |")
+            lines.append("")
+    # 若 config 为空，补充 report 参数
+    if not config:
+        lines.extend([
+            "| 参数 | 值 |",
+            "|------|-----|",
+            f"| DATASET | {args.dataset or 'N/A'} |",
+            f"| QPS | {args.qps or 'N/A'} |",
+            f"| LEAD_TIME | {args.lead_time or 'N/A'} |",
+            "",
+        ])
+
     lines.extend([
-        f"| DATASET (report) | {args.dataset or config.get('DATASET', 'N/A')} |",
-        f"| QPS (report) | {args.qps or config.get('QPS', 'N/A')} |",
-        f"| LEAD_TIME (report) | {args.lead_time or config.get('PREFETCH_LEAD_TIME', 'N/A')} |",
-        "",
         "## 2. TTFT 对比",
         "",
         "| 指标 | PCIe Sched | Baseline | 变化 |",

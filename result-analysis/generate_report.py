@@ -26,11 +26,11 @@ def load_jsonl(path: str) -> pd.DataFrame:
 
 
 def _format_config_section(title: str, config_str: str) -> str:
-    """将配置字符串格式化为 Markdown 列表"""
+    """将配置字符串格式化为 Markdown 列表。支持逗号或换行分隔的 key=value。"""
     if not config_str or config_str.strip() == "未指定":
         return ""
     lines = []
-    for part in config_str.split(","):
+    for part in config_str.replace(",", "\n").split("\n"):
         part = part.strip()
         if "=" in part:
             k, v = part.split("=", 1)
@@ -48,9 +48,23 @@ def main():
     parser.add_argument("--prefetch", required=True, help="Prefetch JSONL 路径")
     parser.add_argument("--output", required=True, help="输出 Markdown 路径")
     parser.add_argument("--config", type=str, default="", help="配置摘要")
+    parser.add_argument("--config-file", type=str, default="", help="从文件读取完整配置（key=value 格式，用于填充配置详情）")
     parser.add_argument("--vllm-config", type=str, default="", help="vLLM 配置详情")
     parser.add_argument("--test-config", type=str, default="", help="测试配置详情")
     args = parser.parse_args()
+
+    # 若指定 --config-file，从文件读取配置（覆盖空的 --config）
+    if args.config_file and (not args.config or args.config.strip() == ""):
+        try:
+            with open(args.config_file, "r", encoding="utf-8") as f:
+                lines = []
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        lines.append(line)
+                args.config = "\n".join(lines)
+        except OSError:
+            pass
 
     df_b = load_jsonl(args.baseline)
     df_p = load_jsonl(args.prefetch)
