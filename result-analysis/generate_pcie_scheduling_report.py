@@ -103,6 +103,37 @@ def compute_tpot_stats(rows: list[dict]) -> dict[str, float]:
     }
 
 
+def extract_pcie_scheduler_stats(log_path: Path) -> dict[str, int] | None:
+    """Extract PCIe Scheduler Stats from vllm log file.
+
+    Looks for lines like:
+    INFO ... PCIe Scheduler Stats: submitted=300, deferred=12, restore=80, prefetch=140, evict=80, max_queue=5, throttled=15, pp_idle_flushes=0
+
+    Returns the last occurrence (most recent stats).
+    """
+    if not log_path.exists():
+        return None
+
+    last_stats = None
+    with open(log_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if "PCIe Scheduler Stats:" in line:
+                # Parse the stats from the log line
+                stats_part = line.split("PCIe Scheduler Stats:")[1].strip()
+                stats = {}
+                for pair in stats_part.split(","):
+                    pair = pair.strip()
+                    if "=" in pair:
+                        k, v = pair.split("=", 1)
+                        try:
+                            stats[k.strip()] = int(v.strip())
+                        except ValueError:
+                            pass
+                if stats:
+                    last_stats = stats
+    return last_stats
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate PCIe Scheduling A/B Report"
@@ -135,6 +166,10 @@ def main() -> None:
 
     pcie_stats_sched = analyze_pcie_events(pcie_events_sched)
     pcie_stats_base = analyze_pcie_events(pcie_events_base)
+
+    # Extract PCIe scheduler stats from logs
+    scheduler_stats_sched = extract_pcie_scheduler_stats(base / "vllm_state_pcie_sched.log")
+    scheduler_stats_base = extract_pcie_scheduler_stats(base / "vllm_state_baseline.log")
 
     # Prefetch cached stats
     def cached_stats(rows: list[dict]) -> dict:
@@ -266,6 +301,46 @@ def main() -> None:
         f"- Baseline 成功样本: {ttft_base.get('count', 0)}",
         "",
     ])
+
+    # Add PCIe scheduler statistics section
+    if scheduler_stats_sched:
+        lines.extend([
+            "## 7. PCIe Scheduler 统计",
+            "",
+            "### PCIe Sched 模式",
+            "",
+            "| 指标 | 值 | 说明 |",
+            "|------|-----|------|",
+            f"| 总提交数 (submitted) | {scheduler_stats_sched.get('submitted', 0)} | 所有传输请求 |",
+            f"| Prefetch 延迟数 (deferred) | {scheduler_stats_sched.get('deferred', 0)} | 因 block 不足被延迟 |",
+            f"| Restore 调度数 | {scheduler_stats_sched.get('restore', 0)} | 高优先级恢复 |",
+            f"| Prefetch 调度数 | {scheduler_stats_sched.get('prefetch', 0)} | 中优先级预取 |",
+            f"| Evict 调度数 | {scheduler_stats_sched.get('evict', 0)} | 低优先级驱逐 |",
+            f"| 最大队列深度 (max_queue) | {scheduler_stats_sched.get('max_queue', 0)} | 挂起传输峰值 |",
+            f"| H2D 限流次数 (throttled) | {scheduler_stats_sched.get('throttled', 0)} | 并发达上限 |",
+            f"| PP 空闲期冲刷次数 | {scheduler_stats_sched.get('pp_idle_flushes', 0)} | PP 感知调度 |",
+            "",
+        ])
+        if scheduler_stats_sched.get('deferred', 0) > 0:
+            lines.append(f"**🎯 Prefetch 降优先级生效**: {scheduler_stats_sched['deferred']} 次被延迟")
+            lines.append("")
+        if scheduler_stats_sched.get('throttled', 0) > 0:
+            lines.append(f"**⏸️ H2D 并发控制生效**: {scheduler_stats_sched['throttled']} 次因并发限制被限流")
+            lines.append("")
+    elif scheduler_stats_base:
+        lines.extend([
+            "## 7. PCIe Scheduler 统计",
+            "",
+            "⚠️ PCIe Sched 模式未找到调度器统计，但 Baseline 中有（配置可能有误）",
+            "",
+        ])
+    else:
+        lines.extend([
+            "## 7. PCIe Scheduler 统计",
+            "",
+            "*未找到 PCIe Scheduler 统计日志*",
+            "",
+        ])
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:

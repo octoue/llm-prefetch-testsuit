@@ -105,5 +105,12 @@ if [ -n "$KV_OFFLOADING_SIZE" ] && [ "$KV_OFFLOADING_SIZE" != "0" ]; then
   echo "KV Offloading enabled: ${KV_OFFLOADING_SIZE} GiB"
 fi
 
+if [ "$PCIE_SCHEDULER" -eq 1 ]; then
+  CMD_ARGS+=(--enable-pcie-scheduling)
+  CMD_ARGS+=(--max-concurrent-h2d 2)
+  CMD_ARGS+=(--prefetch-block-threshold 50)
+  echo "PCIe Scheduling parameters added to vLLM args"
+fi
+
 export VLLM_LOGGING_LEVEL="${VLLM_LOG_LEVEL:-INFO}"
 VLLM_SERVER_DEV_MODE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=$FREE_GPUS vllm serve "${CMD_ARGS[@]}" | tee "$VLLM_LOG"
