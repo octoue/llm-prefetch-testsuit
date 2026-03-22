@@ -13,10 +13,14 @@ cd "$SCRIPT_DIR"
 
 # 解析可选参数
 PCIE_SCHEDULER=0
+NO_PP_PHASE_AWARE=0  # 消融实验：禁用 PP Phase 感知，仅验证双队列+Evict-first
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --pcie-scheduler)
             PCIE_SCHEDULER=1
+            shift ;;
+        --no-pp-phase-aware)
+            NO_PP_PHASE_AWARE=1
             shift ;;
         medium)
             shift ;;
@@ -109,6 +113,7 @@ if [ "$PCIE_SCHEDULER" -eq 1 ]; then
   CMD_ARGS+=(--enable-pcie-scheduling)
   CMD_ARGS+=(--max-concurrent-h2d 2)
   CMD_ARGS+=(--prefetch-block-threshold 50)
+  [[ "$NO_PP_PHASE_AWARE" -eq 1 ]] && CMD_ARGS+=(--no-enable-pp-phase-aware) && echo "Ablation: PP-phase-aware disabled"
   echo "PCIe Scheduling parameters added to vLLM args"
 fi
 
