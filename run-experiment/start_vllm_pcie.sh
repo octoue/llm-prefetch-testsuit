@@ -112,7 +112,8 @@ fi
 if [ "$PCIE_SCHEDULER" -eq 1 ]; then
   CMD_ARGS+=(--enable-pcie-scheduling)
   CMD_ARGS+=(--max-concurrent-h2d 2)
-  CMD_ARGS+=(--prefetch-block-threshold 50)
+  CMD_ARGS+=(--prefetch-block-threshold 150)
+  CMD_ARGS+=(--max-queue-wait-ms 30)
   [[ "$NO_PP_PHASE_AWARE" -eq 1 ]] && CMD_ARGS+=(--no-enable-pp-phase-aware) && echo "Ablation: PP-phase-aware disabled"
   echo "PCIe Scheduling parameters added to vLLM args"
 fi

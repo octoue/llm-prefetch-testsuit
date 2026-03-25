@@ -107,7 +107,7 @@ def extract_pcie_scheduler_stats(log_path: Path) -> dict[str, int] | None:
     """Extract PCIe Scheduler Stats from vllm log file.
 
     Looks for lines like:
-    INFO ... PCIe Scheduler Stats: submitted=300, deferred=12, restore=80, prefetch=140, evict=80, max_queue=5, throttled=15, pp_idle_flushes=0
+    INFO ... PCIe Scheduler Stats: submitted=300, deferred=12, restore=80, prefetch=140, evict=80, max_queue=5, throttled=15, pp_idle_flushes=0, prefetch_starved=0
 
     Returns the last occurrence (most recent stats).
     """
@@ -319,6 +319,7 @@ def main() -> None:
             f"| 最大队列深度 (max_queue) | {scheduler_stats_sched.get('max_queue', 0)} | 挂起传输峰值 |",
             f"| H2D 限流次数 (throttled) | {scheduler_stats_sched.get('throttled', 0)} | 并发达上限 |",
             f"| PP 空闲期冲刷次数 | {scheduler_stats_sched.get('pp_idle_flushes', 0)} | PP 感知调度 |",
+            f"| Prefetch 防饥饿分发 | {scheduler_stats_sched.get('prefetch_starved', 0)} | 超 max_queue_wait_ms 强制出队 |",
             "",
         ])
         if scheduler_stats_sched.get('deferred', 0) > 0:
