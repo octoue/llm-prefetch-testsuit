@@ -3,8 +3,8 @@
 # 在 start_vllm.sh 基础上增加：禁用 NVLink、轻量 PCIe Profiler（仅 PCIeTracer，无 torch 开销）
 # 用法: ./start_vllm_pcie.sh [medium|--pcie-scheduler]
 #   medium: 仅提示，与默认共用 NUM_GPU_BLOCKS_OVERRIDE
-#   --pcie-scheduler: 启用 PCIe 调度算法 (VLLM_PCIE_SCHEDULER=1)，用于 A/B 实验 Phase 1
-# 配合 run_pcie_scheduling_ab.sh 使用
+#   --pcie-scheduler: 启用 PCIe 调度算法 (VLLM_PCIE_SCHEDULER=1)，用于 run_pcie_scheduling_ab.sh 的 Phase 3
+# 配合 run_pcie_scheduling_ab.sh 使用（Phase 1～2 请勿加此选项）
 
 set -e
 

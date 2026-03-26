@@ -2,8 +2,9 @@
 """
 PCIe 调度 A/B 实验报告生成器
 
-读取 prefetch_pcie_sched.jsonl、prefetch_baseline.jsonl 及可选的 PCIe 事件文件，
-生成含配置快照、TTFT/TPOT 对比、PCIe 带宽、Prefetch 行为、稳定性等详细报告。
+读取 plain_vllm.jsonl（若存在）、prefetch_baseline.jsonl、prefetch_pcie_sched.jsonl
+及可选的 PCIe 事件文件，生成含配置快照、TTFT/TPOT 对比、PCIe 带宽、Prefetch 行为等报告。
+存在 plain_vllm.jsonl 时为三联对比，否则保持原两列（+Prefetch vs +Prefetch+PCIe）。
 
 用法:
   python generate_pcie_scheduling_report.py --results-dir results/xxx --dataset pcie-medium --qps 1.0 --lead-time 2.0 --output report.md
@@ -148,30 +149,45 @@ def main() -> None:
     base = Path(args.results_dir)
     pcie_sched = load_jsonl(base / "prefetch_pcie_sched.jsonl")
     baseline = load_jsonl(base / "prefetch_baseline.jsonl")
+    plain = load_jsonl(base / "plain_vllm.jsonl")
+    three_way = len(plain) > 0
     config = load_config(base / "config_snapshot.env")
 
     ttft_pcie = compute_ttft_stats(pcie_sched)
     ttft_base = compute_ttft_stats(baseline)
+    ttft_plain = compute_ttft_stats(plain) if three_way else {}
     tpot_pcie = compute_tpot_stats(pcie_sched)
     tpot_base = compute_tpot_stats(baseline)
+    tpot_plain = compute_tpot_stats(plain) if three_way else {}
 
     pcie_events_sched: list[dict] = []
     pcie_events_base: list[dict] = []
+    pcie_events_plain: list[dict] = []
     if (base / "pcie_events_pcie_sched.json").exists():
         with open(base / "pcie_events_pcie_sched.json") as f:
             pcie_events_sched = json.load(f)
     if (base / "pcie_events_baseline.json").exists():
         with open(base / "pcie_events_baseline.json") as f:
             pcie_events_base = json.load(f)
+    if three_way and (base / "pcie_events_plain.json").exists():
+        with open(base / "pcie_events_plain.json") as f:
+            pcie_events_plain = json.load(f)
 
     pcie_stats_sched = analyze_pcie_events(pcie_events_sched)
     pcie_stats_base = analyze_pcie_events(pcie_events_base)
+    pcie_stats_plain = analyze_pcie_events(pcie_events_plain) if three_way else {}
 
-    pcie_events_suspicious_duplicate = bool(
-        pcie_events_sched
-        and pcie_events_base
-        and json.dumps(pcie_events_sched, sort_keys=True)
-        == json.dumps(pcie_events_base, sort_keys=True)
+    def _events_dup(a: list[dict], b: list[dict]) -> bool:
+        return bool(
+            a and b and json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+        )
+
+    pcie_events_suspicious_duplicate = _events_dup(pcie_events_sched, pcie_events_base) or (
+        three_way
+        and (
+            _events_dup(pcie_events_plain, pcie_events_base)
+            or _events_dup(pcie_events_plain, pcie_events_sched)
+        )
     )
 
     # Extract PCIe scheduler stats from logs
@@ -185,6 +201,7 @@ def main() -> None:
 
     cached_sched = cached_stats(pcie_sched)
     cached_base = cached_stats(baseline)
+    cached_plain = cached_stats(plain) if three_way else {}
 
     # 按类别分组配置，便于阅读
     def group_config(cfg: dict[str, str]) -> dict[str, list[tuple[str, str]]]:
@@ -209,9 +226,15 @@ def main() -> None:
 
     cfg_groups = group_config(config)
 
+    report_title = (
+        "# PCIe 调度实验报告（普通 vLLM / +Prefetch / +Prefetch+PCIe）"
+        if three_way
+        else "# PCIe Scheduling A/B 实验报告"
+    )
+
     # Build report
     lines = [
-        "# PCIe Scheduling A/B 实验报告",
+        report_title,
         "",
         "## 1. 配置快照",
         "",
@@ -236,86 +259,178 @@ def main() -> None:
             "",
         ])
 
-    lines.extend([
-        "## 2. TTFT 对比",
-        "",
-        "| 指标 | PCIe Sched | Baseline | 变化 |",
-        "|------|------------|----------|------|",
-    ])
-
-    if ttft_pcie and ttft_base:
-        for k in ["mean", "p50", "p90", "p95", "p99"]:
-            v_s = ttft_pcie.get(k, 0)
-            v_b = ttft_base.get(k, 0)
-            if v_b > 0:
-                delta = (1 - v_s / v_b) * 100
-                lines.append(f"| {k.capitalize()} (ms) | {v_s:.2f} | {v_b:.2f} | {delta:+.1f}% |")
-            else:
-                lines.append(f"| {k.capitalize()} (ms) | {v_s:.2f} | - | - |")
-        if ttft_pcie.get("std") and ttft_base.get("std"):
-            lines.append(f"| Std | {ttft_pcie['std']:.2f} | {ttft_base['std']:.2f} | - |")
-    else:
-        lines.append("| (无足够成功样本) | - | - | - |")
-
-    lines.extend([
-        "",
-        "## 3. TPOT 对比",
-        "",
-        "| 指标 | PCIe Sched | Baseline |",
-        "|------|------------|----------|",
-    ])
-    if tpot_pcie and tpot_base:
-        for k in ["mean", "p50"]:
-            lines.append(f"| {k.capitalize()} (ms) | {tpot_pcie.get(k, 0):.2f} | {tpot_base.get(k, 0):.2f} |")
-    else:
-        lines.append("| (无数据) | - | - |")
-
-    lines.extend([
-        "",
-        "## 4. Prefetch 行为",
-        "",
-        "| 指标 | PCIe Sched | Baseline |",
-        "|------|------------|----------|",
-        f"| 成功样本数 | {cached_sched['total']} | {cached_base['total']} |",
-        f"| Cached 命中数 | {cached_sched['hit_count']} | {cached_base['hit_count']} |",
-        f"| 命中率 (%) | {cached_sched['hit_rate_pct']:.1f} | {cached_base['hit_rate_pct']:.1f} |",
-        "",
-        "## 5. PCIe 带宽统计 (若已采集)",
-        "",
-    ])
-
-    if pcie_events_suspicious_duplicate:
+    if three_way:
         lines.extend([
-            "⚠️ **警告**: 两侧 `pcie_events_*.json` 合并结果完全一致，第五部分统计必然相同。",
-            "常见原因：Phase 之间未清空 profiler 目录中的 `pcie_events_*.json`，或采集前未调用 `stop_profile` 导致仍读到上一轮落盘数据。",
-            "请使用已修复的 `run_pcie_scheduling_ab.sh`（含 `start_profile` / `stop_profile` 与 Phase 间删除事件文件）重新跑实验。",
+            "## 2. TTFT 对比",
+            "",
+            "| 指标 | 普通 vLLM (ms) | +Prefetch (ms) | +Prefetch+PCIe (ms) | PCIe 相对 +Prefetch |",
+            "|------|----------------|----------------|---------------------|---------------------|",
+        ])
+        if ttft_pcie and ttft_base and ttft_plain:
+            for k in ["mean", "p50", "p90", "p95", "p99"]:
+                v_p = ttft_plain.get(k, 0)
+                v_b = ttft_base.get(k, 0)
+                v_s = ttft_pcie.get(k, 0)
+                if v_b > 0:
+                    delta = (1 - v_s / v_b) * 100
+                    lines.append(
+                        f"| {k.capitalize()} | {v_p:.2f} | {v_b:.2f} | {v_s:.2f} | {delta:+.1f}% |"
+                    )
+                else:
+                    lines.append(f"| {k.capitalize()} | {v_p:.2f} | {v_b:.2f} | {v_s:.2f} | - |")
+            if ttft_pcie.get("std") and ttft_base.get("std") and ttft_plain.get("std"):
+                lines.append(
+                    f"| Std | {ttft_plain['std']:.2f} | {ttft_base['std']:.2f} | {ttft_pcie['std']:.2f} | - |"
+                )
+        else:
+            lines.append("| (无足够成功样本) | - | - | - | - |")
+
+        lines.extend([
+            "",
+            "## 3. TPOT 对比",
+            "",
+            "| 指标 | 普通 vLLM (ms) | +Prefetch (ms) | +Prefetch+PCIe (ms) |",
+            "|------|----------------|----------------|---------------------|",
+        ])
+        if tpot_pcie and tpot_base and tpot_plain:
+            for k in ["mean", "p50"]:
+                lines.append(
+                    f"| {k.capitalize()} | {tpot_plain.get(k, 0):.2f} | {tpot_base.get(k, 0):.2f} | {tpot_pcie.get(k, 0):.2f} |"
+                )
+        else:
+            lines.append("| (无数据) | - | - | - |")
+
+        lines.extend([
+            "",
+            "## 4. Prefetch / Cache 行为",
+            "",
+            "| 指标 | 普通 vLLM | +Prefetch | +Prefetch+PCIe |",
+            "|------|-----------|-----------|----------------|",
+            f"| 成功样本数 | {cached_plain['total']} | {cached_base['total']} | {cached_sched['total']} |",
+            f"| Cached 命中数 | {cached_plain['hit_count']} | {cached_base['hit_count']} | {cached_sched['hit_count']} |",
+            f"| 命中率 (%) | {cached_plain['hit_rate_pct']:.1f} | {cached_base['hit_rate_pct']:.1f} | {cached_sched['hit_rate_pct']:.1f} |",
+            "",
+            "## 5. PCIe 带宽统计 (若已采集)",
             "",
         ])
 
-    if pcie_stats_sched or pcie_stats_base:
+        if pcie_events_suspicious_duplicate:
+            lines.extend([
+                "⚠️ **警告**: 某两相 `pcie_events_*.json` 合并结果完全一致，本节统计可能失真。",
+                "常见原因：Phase 之间未清空 profiler 目录，或未正确 `stop_profile`。",
+                "请使用含 Phase 间删除事件文件的 `run_pcie_scheduling_ab.sh` 重新跑实验。",
+                "",
+            ])
+
+        if pcie_stats_sched or pcie_stats_base or pcie_stats_plain:
+            lines.extend([
+                "| 指标 | 普通 vLLM | +Prefetch | +Prefetch+PCIe |",
+                "|------|-----------|-----------|----------------|",
+            ])
+            for k in ["h2d_count", "h2d_total_gb", "d2h_count", "d2h_total_gb", "h2d_bandwidth_gbps", "duration_s"]:
+                v_pl = pcie_stats_plain.get(k, "-")
+                v_b = pcie_stats_base.get(k, "-")
+                v_s = pcie_stats_sched.get(k, "-")
+                if isinstance(v_pl, float):
+                    v_pl = f"{v_pl:.2f}"
+                if isinstance(v_b, float):
+                    v_b = f"{v_b:.2f}"
+                if isinstance(v_s, float):
+                    v_s = f"{v_s:.2f}"
+                lines.append(f"| {k} | {v_pl} | {v_b} | {v_s} |")
+        else:
+            lines.append("*未找到 pcie_events_*.json，跳过 PCIe 带宽统计*")
+
         lines.extend([
+            "",
+            "## 6. 稳定性",
+            "",
+            f"- 普通 vLLM 成功样本: {ttft_plain.get('count', 0)}",
+            f"- +Prefetch 成功样本: {ttft_base.get('count', 0)}",
+            f"- +Prefetch+PCIe 成功样本: {ttft_pcie.get('count', 0)}",
+            "",
+        ])
+    else:
+        lines.extend([
+            "## 2. TTFT 对比",
+            "",
+            "| 指标 | PCIe Sched | Baseline | 变化 |",
+            "|------|------------|----------|------|",
+        ])
+
+        if ttft_pcie and ttft_base:
+            for k in ["mean", "p50", "p90", "p95", "p99"]:
+                v_s = ttft_pcie.get(k, 0)
+                v_b = ttft_base.get(k, 0)
+                if v_b > 0:
+                    delta = (1 - v_s / v_b) * 100
+                    lines.append(f"| {k.capitalize()} (ms) | {v_s:.2f} | {v_b:.2f} | {delta:+.1f}% |")
+                else:
+                    lines.append(f"| {k.capitalize()} (ms) | {v_s:.2f} | - | - |")
+            if ttft_pcie.get("std") and ttft_base.get("std"):
+                lines.append(f"| Std | {ttft_pcie['std']:.2f} | {ttft_base['std']:.2f} | - |")
+        else:
+            lines.append("| (无足够成功样本) | - | - | - |")
+
+        lines.extend([
+            "",
+            "## 3. TPOT 对比",
+            "",
             "| 指标 | PCIe Sched | Baseline |",
             "|------|------------|----------|",
         ])
-        for k in ["h2d_count", "h2d_total_gb", "d2h_count", "d2h_total_gb", "h2d_bandwidth_gbps", "duration_s"]:
-            v_s = pcie_stats_sched.get(k, "-")
-            v_b = pcie_stats_base.get(k, "-")
-            if isinstance(v_s, float):
-                v_s = f"{v_s:.2f}"
-            if isinstance(v_b, float):
-                v_b = f"{v_b:.2f}"
-            lines.append(f"| {k} | {v_s} | {v_b} |")
-    else:
-        lines.append("*未找到 pcie_events_*.json，跳过 PCIe 带宽统计*")
+        if tpot_pcie and tpot_base:
+            for k in ["mean", "p50"]:
+                lines.append(f"| {k.capitalize()} (ms) | {tpot_pcie.get(k, 0):.2f} | {tpot_base.get(k, 0):.2f} |")
+        else:
+            lines.append("| (无数据) | - | - |")
 
-    lines.extend([
-        "",
-        "## 6. 稳定性",
-        "",
-        f"- PCIe Sched 成功样本: {ttft_pcie.get('count', 0)}",
-        f"- Baseline 成功样本: {ttft_base.get('count', 0)}",
-        "",
-    ])
+        lines.extend([
+            "",
+            "## 4. Prefetch 行为",
+            "",
+            "| 指标 | PCIe Sched | Baseline |",
+            "|------|------------|----------|",
+            f"| 成功样本数 | {cached_sched['total']} | {cached_base['total']} |",
+            f"| Cached 命中数 | {cached_sched['hit_count']} | {cached_base['hit_count']} |",
+            f"| 命中率 (%) | {cached_sched['hit_rate_pct']:.1f} | {cached_base['hit_rate_pct']:.1f} |",
+            "",
+            "## 5. PCIe 带宽统计 (若已采集)",
+            "",
+        ])
+
+        if pcie_events_suspicious_duplicate:
+            lines.extend([
+                "⚠️ **警告**: 两侧 `pcie_events_*.json` 合并结果完全一致，第五部分统计必然相同。",
+                "常见原因：Phase 之间未清空 profiler 目录中的 `pcie_events_*.json`，或采集前未调用 `stop_profile` 导致仍读到上一轮落盘数据。",
+                "请使用已修复的 `run_pcie_scheduling_ab.sh`（含 `start_profile` / `stop_profile` 与 Phase 间删除事件文件）重新跑实验。",
+                "",
+            ])
+
+        if pcie_stats_sched or pcie_stats_base:
+            lines.extend([
+                "| 指标 | PCIe Sched | Baseline |",
+                "|------|------------|----------|",
+            ])
+            for k in ["h2d_count", "h2d_total_gb", "d2h_count", "d2h_total_gb", "h2d_bandwidth_gbps", "duration_s"]:
+                v_s = pcie_stats_sched.get(k, "-")
+                v_b = pcie_stats_base.get(k, "-")
+                if isinstance(v_s, float):
+                    v_s = f"{v_s:.2f}"
+                if isinstance(v_b, float):
+                    v_b = f"{v_b:.2f}"
+                lines.append(f"| {k} | {v_s} | {v_b} |")
+        else:
+            lines.append("*未找到 pcie_events_*.json，跳过 PCIe 带宽统计*")
+
+        lines.extend([
+            "",
+            "## 6. 稳定性",
+            "",
+            f"- PCIe Sched 成功样本: {ttft_pcie.get('count', 0)}",
+            f"- Baseline 成功样本: {ttft_base.get('count', 0)}",
+            "",
+        ])
 
     # Add PCIe scheduler statistics section
     if scheduler_stats_sched:

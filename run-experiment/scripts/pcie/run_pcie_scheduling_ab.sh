@@ -1,8 +1,11 @@
 #!/bin/bash
-# PCIe 调度 A/B 实验脚本
+# PCIe 调度 A/B 实验脚本（三联对比）
 #
-# 对比 VLLM_PCIE_SCHEDULER=1（启用）与 未启用 两种配置下的 Prefetch 表现。
-# 实验流程：Phase 1 启用调度 → Phase 2 未启用 → Phase 3 生成对比报告
+# 1. 普通 vLLM：客户端 --mode baseline（不发 prefetch）；服务端无 PCIe 调度（与 2 相同进程）
+# 2. vLLM + Prefetch：--mode prefetch，服务端仍无 PCIe 调度
+# 3. vLLM + Prefetch + PCIe 调度：--mode prefetch，服务端 start_vllm_pcie.sh --pcie-scheduler
+#
+# 流程：Phase 1～2 共用「无 PCIe 调度」的 vLLM → 重启并启用调度 → Phase 3 → Phase 4 生成报告
 #
 # 用法:
 #   ./run_pcie_scheduling_ab.sh [dataset] [options]
@@ -12,8 +15,8 @@
 #   ./run_pcie_scheduling_ab.sh pcie-heavy --qps 3.0
 #   ./run_pcie_scheduling_ab.sh pcie-full   # 直接使用 data/qwen_traceA_blksz_16.jsonl（与 medium 同参数范式）
 #
-# 注意: 需在 Phase 1 前用 start_vllm_pcie.sh --pcie-scheduler 启动 vLLM；
-#       Phase 1 结束后需重启 vLLM（不用 --pcie-scheduler）再继续 Phase 2。
+# 注意: Phase 1 前用 ./start_vllm_pcie.sh（不要加 --pcie-scheduler）；
+#       Phase 2 结束后重启 vLLM 并加 --pcie-scheduler 再跑 Phase 3。
 
 set -e
 
@@ -70,7 +73,7 @@ fi
 mkdir -p "$PCIE_PROFILER_DIR"
 
 print_separator
-echo "PCIe Scheduling A/B Experiment"
+echo "PCIe Scheduling A/B Experiment (Plain / Prefetch / Prefetch+PCIe)"
 print_separator
 echo "Dataset: $DATASET"
 echo "Trace: $TRACE"
@@ -82,13 +85,13 @@ echo "Results: $RESULTS_DIR"
 print_separator
 
 # ------------------------------------------------------------------
-# Phase 1: Prefetch + PCIe Scheduling (VLLM_PCIE_SCHEDULER=1)
+# Phase 1: 普通 vLLM（客户端不发 prefetch；服务端无 PCIe 调度）
 # ------------------------------------------------------------------
-print_phase "[Phase 1/3] Prefetch with PCIe Scheduling (VLLM_PCIE_SCHEDULER=1)"
+print_phase "[Phase 1/4] Plain vLLM (no client prefetch, no PCIe scheduling)"
 
 if ! check_vllm_running; then
     echo "❌ Error: vLLM not running."
-    echo "Start with: ./start_vllm_pcie.sh --pcie-scheduler"
+    echo "Start with: ./start_vllm_pcie.sh   (do NOT use --pcie-scheduler yet)"
     exit 1
 fi
 
@@ -96,7 +99,151 @@ echo "Resetting prefix cache..."
 curl -s -X POST "http://localhost:$API_PORT/reset_prefix_cache?reset_external=true" >/dev/null || true
 sleep 5
 
-# 避免沿用上轮实验的 PCIe 事件文件；与 run_profiling.sh 一致需 start/stop_profile 才能落盘
+echo "Clearing stale PCIe event files in $PCIE_PROFILER_DIR..."
+rm -f "$PCIE_PROFILER_DIR"/pcie_events_*.json 2>/dev/null || true
+echo "Starting PCIe profiler..."
+curl -s -X POST "http://localhost:$API_PORT/start_profile" >/dev/null || true
+
+TB_ARGS=()
+[[ $ENABLE_TENSORBOARD -eq 1 && $NO_TENSORBOARD -eq 0 ]] && \
+    TB_ARGS=(--tensorboard-dir "$RESULTS_DIR/tensorboard/plain_vllm")
+
+python3 prefetch_ab_runner.py \
+    --trace-file "$TRACE" \
+    --mode baseline \
+    --qps "$QPS" \
+    --num-multi-turn "$NUM_CONV" \
+    --model "$MODEL_PATH" \
+    --api-base "http://localhost:$API_PORT/v1" \
+    --output "$RESULTS_DIR/plain_vllm.jsonl" \
+    --seed "$SEED" \
+    --timeout "$TIMEOUT" \
+    --request-timeout "$REQUEST_TIMEOUT" \
+    --prefetch-lead-time "$PREFETCH_LEAD_TIME" \
+    --schedule-mode "$SCHEDULE_MODE" \
+    "${TB_ARGS[@]}" \
+    &> "$RESULTS_DIR/plain_vllm.log"
+
+echo "✓ Phase 1 completed"
+
+echo "Flushing PCIe profiler to disk (stop_profile)..."
+curl -s -X POST "http://localhost:$API_PORT/stop_profile" >/dev/null || true
+sleep 3
+
+PCIE_FILES=$(ls "$PCIE_PROFILER_DIR"/pcie_events_*.json 2>/dev/null || true)
+if [[ -n "$PCIE_FILES" ]]; then
+    PCIE_COUNT=$(echo "$PCIE_FILES" | wc -l | tr -d ' ')
+    if [[ $PCIE_COUNT -gt 1 ]]; then
+        python3 -c "
+import json, glob
+events = []
+for f in sorted(glob.glob('$PCIE_PROFILER_DIR/pcie_events_*.json')):
+    with open(f) as fp:
+        events.extend(json.load(fp))
+with open('$RESULTS_DIR/pcie_events_plain.json', 'w') as fp:
+    json.dump(events, fp, indent=2)
+print(f'Merged {len(events)} events')
+"
+    else
+        cp "$PCIE_PROFILER_DIR/pcie_events_0.json" "$RESULTS_DIR/pcie_events_plain.json"
+    fi
+fi
+[[ -f "$VLLM_LOG" ]] && cp "$VLLM_LOG" "$RESULTS_DIR/vllm_state_plain.log" 2>/dev/null || true
+
+echo "Removing profiler PCIe event files before Phase 2..."
+rm -f "$PCIE_PROFILER_DIR"/pcie_events_*.json 2>/dev/null || true
+
+# ------------------------------------------------------------------
+# Phase 2: Prefetch，无 PCIe 调度（与 Phase 1 同一 vLLM 进程，无需重启）
+# ------------------------------------------------------------------
+if ! check_vllm_running; then
+    echo "❌ Error: vLLM not running."
+    exit 1
+fi
+
+print_phase "[Phase 2/4] vLLM + Prefetch (no PCIe scheduling)"
+
+echo "Resetting prefix cache..."
+curl -s -X POST "http://localhost:$API_PORT/reset_prefix_cache?reset_external=true" >/dev/null || true
+sleep 5
+
+echo "Starting PCIe profiler..."
+curl -s -X POST "http://localhost:$API_PORT/start_profile" >/dev/null || true
+
+TB_ARGS=()
+[[ $ENABLE_TENSORBOARD -eq 1 && $NO_TENSORBOARD -eq 0 ]] && \
+    TB_ARGS=(--tensorboard-dir "$RESULTS_DIR/tensorboard/prefetch_no_sched")
+
+python3 prefetch_ab_runner.py \
+    --trace-file "$TRACE" \
+    --mode prefetch \
+    --qps "$QPS" \
+    --num-multi-turn "$NUM_CONV" \
+    --model "$MODEL_PATH" \
+    --api-base "http://localhost:$API_PORT/v1" \
+    --output "$RESULTS_DIR/prefetch_baseline.jsonl" \
+    --seed "$SEED" \
+    --timeout "$TIMEOUT" \
+    --request-timeout "$REQUEST_TIMEOUT" \
+    --prefetch-lead-time "$PREFETCH_LEAD_TIME" \
+    --schedule-mode "$SCHEDULE_MODE" \
+    "${TB_ARGS[@]}" \
+    &> "$RESULTS_DIR/prefetch_baseline.log"
+
+echo "✓ Phase 2 completed"
+
+echo "Flushing PCIe profiler to disk (stop_profile)..."
+curl -s -X POST "http://localhost:$API_PORT/stop_profile" >/dev/null || true
+sleep 3
+
+PCIE_FILES=$(ls "$PCIE_PROFILER_DIR"/pcie_events_*.json 2>/dev/null || true)
+if [[ -n "$PCIE_FILES" ]]; then
+    PCIE_COUNT=$(echo "$PCIE_FILES" | wc -l | tr -d ' ')
+    if [[ $PCIE_COUNT -gt 1 ]]; then
+        python3 -c "
+import json, glob
+events = []
+for f in sorted(glob.glob('$PCIE_PROFILER_DIR/pcie_events_*.json')):
+    with open(f) as fp:
+        events.extend(json.load(fp))
+with open('$RESULTS_DIR/pcie_events_baseline.json', 'w') as fp:
+    json.dump(events, fp, indent=2)
+"
+    else
+        cp "$PCIE_PROFILER_DIR/pcie_events_0.json" "$RESULTS_DIR/pcie_events_baseline.json"
+    fi
+fi
+[[ -f "$VLLM_LOG" ]] && cp "$VLLM_LOG" "$RESULTS_DIR/vllm_state_baseline.log" 2>/dev/null || true
+
+echo "Removing profiler PCIe event files before Phase 3..."
+rm -f "$PCIE_PROFILER_DIR"/pcie_events_*.json 2>/dev/null || true
+
+# ------------------------------------------------------------------
+# 提示用户重启 vLLM 并启用 PCIe 调度
+# ------------------------------------------------------------------
+echo ""
+print_separator
+echo "⚠️  Please RESTART vLLM WITH PCIe scheduler for Phase 3:"
+echo "   1. Stop current vLLM (Ctrl+C)"
+echo "   2. Start: ./start_vllm_pcie.sh --pcie-scheduler"
+echo "   3. Press Enter here to continue Phase 3"
+print_separator
+read -r
+
+# ------------------------------------------------------------------
+# Phase 3: Prefetch + PCIe 调度
+# ------------------------------------------------------------------
+if ! check_vllm_running; then
+    echo "❌ Error: vLLM not running. Start with ./start_vllm_pcie.sh --pcie-scheduler"
+    exit 1
+fi
+
+print_phase "[Phase 3/4] vLLM + Prefetch + PCIe scheduling"
+
+echo "Resetting prefix cache..."
+curl -s -X POST "http://localhost:$API_PORT/reset_prefix_cache?reset_external=true" >/dev/null || true
+sleep 5
+
 echo "Clearing stale PCIe event files in $PCIE_PROFILER_DIR..."
 rm -f "$PCIE_PROFILER_DIR"/pcie_events_*.json 2>/dev/null || true
 echo "Starting PCIe profiler..."
@@ -122,13 +269,12 @@ python3 prefetch_ab_runner.py \
     "${TB_ARGS[@]}" \
     &> "$RESULTS_DIR/prefetch_pcie_sched.log"
 
-echo "✓ Phase 1 completed"
+echo "✓ Phase 3 completed"
 
 echo "Flushing PCIe profiler to disk (stop_profile)..."
 curl -s -X POST "http://localhost:$API_PORT/stop_profile" >/dev/null || true
 sleep 3
 
-# 收集 PCIe 事件（若有）
 PCIE_FILES=$(ls "$PCIE_PROFILER_DIR"/pcie_events_*.json 2>/dev/null || true)
 if [[ -n "$PCIE_FILES" ]]; then
     PCIE_COUNT=$(echo "$PCIE_FILES" | wc -l | tr -d ' ')
@@ -149,89 +295,10 @@ print(f'Merged {len(events)} events')
 fi
 [[ -f "$VLLM_LOG" ]] && cp "$VLLM_LOG" "$RESULTS_DIR/vllm_state_pcie_sched.log" 2>/dev/null || true
 
-# Phase 2 会重新写入 profiler；若不删除，baseline 易重复采集 Phase 1 的 pcie_events_*.json
-echo "Removing profiler PCIe event files before Phase 2..."
-rm -f "$PCIE_PROFILER_DIR"/pcie_events_*.json 2>/dev/null || true
-
 # ------------------------------------------------------------------
-# 提示用户重启 vLLM
+# Phase 4: 生成对比报告
 # ------------------------------------------------------------------
-echo ""
-print_separator
-echo "⚠️  Please RESTART vLLM WITHOUT PCIe scheduler:"
-echo "   1. Stop current vLLM (Ctrl+C in the terminal running vLLM)"
-echo "   2. Start: ./start_vllm_pcie.sh   (no --pcie-scheduler)"
-echo "   3. Press Enter here to continue Phase 2"
-print_separator
-read -r
-
-# ------------------------------------------------------------------
-# Phase 2: Prefetch + No Scheduling (baseline)
-# ------------------------------------------------------------------
-if ! check_vllm_running; then
-    echo "❌ Error: vLLM not running. Start vLLM without --pcie-scheduler and re-run."
-    exit 1
-fi
-
-print_phase "[Phase 2/3] Prefetch without PCIe Scheduling (baseline)"
-
-echo "Resetting prefix cache..."
-curl -s -X POST "http://localhost:$API_PORT/reset_prefix_cache?reset_external=true" >/dev/null || true
-sleep 5
-
-echo "Starting PCIe profiler..."
-curl -s -X POST "http://localhost:$API_PORT/start_profile" >/dev/null || true
-
-TB_ARGS=()
-[[ $ENABLE_TENSORBOARD -eq 1 && $NO_TENSORBOARD -eq 0 ]] && \
-    TB_ARGS=(--tensorboard-dir "$RESULTS_DIR/tensorboard/baseline")
-
-python3 prefetch_ab_runner.py \
-    --trace-file "$TRACE" \
-    --mode prefetch \
-    --qps "$QPS" \
-    --num-multi-turn "$NUM_CONV" \
-    --model "$MODEL_PATH" \
-    --api-base "http://localhost:$API_PORT/v1" \
-    --output "$RESULTS_DIR/prefetch_baseline.jsonl" \
-    --seed "$SEED" \
-    --timeout "$TIMEOUT" \
-    --request-timeout "$REQUEST_TIMEOUT" \
-    --prefetch-lead-time "$PREFETCH_LEAD_TIME" \
-    --schedule-mode "$SCHEDULE_MODE" \
-    "${TB_ARGS[@]}" \
-    &> "$RESULTS_DIR/prefetch_baseline.log"
-
-echo "✓ Phase 2 completed"
-
-echo "Flushing PCIe profiler to disk (stop_profile)..."
-curl -s -X POST "http://localhost:$API_PORT/stop_profile" >/dev/null || true
-sleep 3
-
-# 收集 baseline PCIe 事件
-PCIE_FILES=$(ls "$PCIE_PROFILER_DIR"/pcie_events_*.json 2>/dev/null || true)
-if [[ -n "$PCIE_FILES" ]]; then
-    PCIE_COUNT=$(echo "$PCIE_FILES" | wc -l | tr -d ' ')
-    if [[ $PCIE_COUNT -gt 1 ]]; then
-        python3 -c "
-import json, glob
-events = []
-for f in sorted(glob.glob('$PCIE_PROFILER_DIR/pcie_events_*.json')):
-    with open(f) as fp:
-        events.extend(json.load(fp))
-with open('$RESULTS_DIR/pcie_events_baseline.json', 'w') as fp:
-    json.dump(events, fp, indent=2)
-"
-    else
-        cp "$PCIE_PROFILER_DIR/pcie_events_0.json" "$RESULTS_DIR/pcie_events_baseline.json"
-    fi
-fi
-[[ -f "$VLLM_LOG" ]] && cp "$VLLM_LOG" "$RESULTS_DIR/vllm_state_baseline.log" 2>/dev/null || true
-
-# ------------------------------------------------------------------
-# Phase 3: 生成对比报告
-# ------------------------------------------------------------------
-print_phase "[Phase 3/3] Generating comparison report..."
+print_phase "[Phase 4/4] Generating comparison report..."
 
 # 先保存完整配置快照（供报告和 generate_report 使用）
 {
@@ -261,6 +328,7 @@ bash dump_config.sh >> "$RESULTS_DIR/config_snapshot.env" 2>/dev/null || true
 
 # 使用 generate_report 做 TTFT/TPOT 对比（传入配置文件以修复配置详情为空）
 python3 ../result-analysis/generate_report.py \
+    --plain "$RESULTS_DIR/plain_vllm.jsonl" \
     --baseline "$RESULTS_DIR/prefetch_baseline.jsonl" \
     --prefetch "$RESULTS_DIR/prefetch_pcie_sched.jsonl" \
     --output "$RESULTS_DIR/ttft_report.md" \
@@ -288,5 +356,5 @@ echo "Results:"
 echo "  Directory: $RESULTS_DIR"
 echo "  TTFT report: $RESULTS_DIR/ttft_report.md"
 echo "  PCIe scheduling report: $RESULTS_DIR/pcie_scheduling_report.md"
-echo "  Logs: prefetch_pcie_sched.log, prefetch_baseline.log"
+echo "  Logs: plain_vllm.log, prefetch_baseline.log, prefetch_pcie_sched.log"
 print_separator
