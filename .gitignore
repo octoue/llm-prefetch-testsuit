@@ -4,3 +4,5 @@ runs/
 results/
 docs/
 .claude/
+run-experiment/vllm_state.log
+run-experiment/profiler_output/
