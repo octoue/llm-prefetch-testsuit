@@ -167,6 +167,13 @@ def main() -> None:
     pcie_stats_sched = analyze_pcie_events(pcie_events_sched)
     pcie_stats_base = analyze_pcie_events(pcie_events_base)
 
+    pcie_events_suspicious_duplicate = bool(
+        pcie_events_sched
+        and pcie_events_base
+        and json.dumps(pcie_events_sched, sort_keys=True)
+        == json.dumps(pcie_events_base, sort_keys=True)
+    )
+
     # Extract PCIe scheduler stats from logs
     scheduler_stats_sched = extract_pcie_scheduler_stats(base / "vllm_state_pcie_sched.log")
     scheduler_stats_base = extract_pcie_scheduler_stats(base / "vllm_state_baseline.log")
@@ -276,6 +283,14 @@ def main() -> None:
         "## 5. PCIe 带宽统计 (若已采集)",
         "",
     ])
+
+    if pcie_events_suspicious_duplicate:
+        lines.extend([
+            "⚠️ **警告**: 两侧 `pcie_events_*.json` 合并结果完全一致，第五部分统计必然相同。",
+            "常见原因：Phase 之间未清空 profiler 目录中的 `pcie_events_*.json`，或采集前未调用 `stop_profile` 导致仍读到上一轮落盘数据。",
+            "请使用已修复的 `run_pcie_scheduling_ab.sh`（含 `start_profile` / `stop_profile` 与 Phase 间删除事件文件）重新跑实验。",
+            "",
+        ])
 
     if pcie_stats_sched or pcie_stats_base:
         lines.extend([

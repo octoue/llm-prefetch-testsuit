@@ -10,6 +10,7 @@
 # 示例:
 #   ./run_pcie_scheduling_ab.sh pcie-medium
 #   ./run_pcie_scheduling_ab.sh pcie-heavy --qps 3.0
+#   ./run_pcie_scheduling_ab.sh pcie-full   # 直接使用 data/qwen_traceA_blksz_16.jsonl（与 medium 同参数范式）
 #
 # 注意: 需在 Phase 1 前用 start_vllm_pcie.sh --pcie-scheduler 启动 vLLM；
 #       Phase 1 结束后需重启 vLLM（不用 --pcie-scheduler）再继续 Phase 2。
@@ -61,6 +62,13 @@ generate_dataset_if_needed "$TRACE" "$FULL_TRACE" "$DATASET" || exit 1
 RESULTS_DIR="$RESULTS_ROOT/pcie_sched_${DATASET}_qps${QPS}_lead${PREFETCH_LEAD_TIME}"
 mkdir -p "$RESULTS_DIR"
 
+# Profiler 目录改为绝对路径（与 start_vllm_pcie.sh 一致），便于清空与收集
+RUN_EXP_ROOT="$(pwd)"
+if [[ "$PCIE_PROFILER_DIR" != /* ]]; then
+    PCIE_PROFILER_DIR="$RUN_EXP_ROOT/${PCIE_PROFILER_DIR#./}"
+fi
+mkdir -p "$PCIE_PROFILER_DIR"
+
 print_separator
 echo "PCIe Scheduling A/B Experiment"
 print_separator
@@ -88,6 +96,12 @@ echo "Resetting prefix cache..."
 curl -s -X POST "http://localhost:$API_PORT/reset_prefix_cache?reset_external=true" >/dev/null || true
 sleep 5
 
+# 避免沿用上轮实验的 PCIe 事件文件；与 run_profiling.sh 一致需 start/stop_profile 才能落盘
+echo "Clearing stale PCIe event files in $PCIE_PROFILER_DIR..."
+rm -f "$PCIE_PROFILER_DIR"/pcie_events_*.json 2>/dev/null || true
+echo "Starting PCIe profiler..."
+curl -s -X POST "http://localhost:$API_PORT/start_profile" >/dev/null || true
+
 TB_ARGS=()
 [[ $ENABLE_TENSORBOARD -eq 1 && $NO_TENSORBOARD -eq 0 ]] && \
     TB_ARGS=(--tensorboard-dir "$RESULTS_DIR/tensorboard/pcie_sched")
@@ -110,6 +124,10 @@ python3 prefetch_ab_runner.py \
 
 echo "✓ Phase 1 completed"
 
+echo "Flushing PCIe profiler to disk (stop_profile)..."
+curl -s -X POST "http://localhost:$API_PORT/stop_profile" >/dev/null || true
+sleep 3
+
 # 收集 PCIe 事件（若有）
 PCIE_FILES=$(ls "$PCIE_PROFILER_DIR"/pcie_events_*.json 2>/dev/null || true)
 if [[ -n "$PCIE_FILES" ]]; then
@@ -130,6 +148,10 @@ print(f'Merged {len(events)} events')
     fi
 fi
 [[ -f "$VLLM_LOG" ]] && cp "$VLLM_LOG" "$RESULTS_DIR/vllm_state_pcie_sched.log" 2>/dev/null || true
+
+# Phase 2 会重新写入 profiler；若不删除，baseline 易重复采集 Phase 1 的 pcie_events_*.json
+echo "Removing profiler PCIe event files before Phase 2..."
+rm -f "$PCIE_PROFILER_DIR"/pcie_events_*.json 2>/dev/null || true
 
 # ------------------------------------------------------------------
 # 提示用户重启 vLLM
@@ -157,6 +179,9 @@ echo "Resetting prefix cache..."
 curl -s -X POST "http://localhost:$API_PORT/reset_prefix_cache?reset_external=true" >/dev/null || true
 sleep 5
 
+echo "Starting PCIe profiler..."
+curl -s -X POST "http://localhost:$API_PORT/start_profile" >/dev/null || true
+
 TB_ARGS=()
 [[ $ENABLE_TENSORBOARD -eq 1 && $NO_TENSORBOARD -eq 0 ]] && \
     TB_ARGS=(--tensorboard-dir "$RESULTS_DIR/tensorboard/baseline")
@@ -178,6 +203,10 @@ python3 prefetch_ab_runner.py \
     &> "$RESULTS_DIR/prefetch_baseline.log"
 
 echo "✓ Phase 2 completed"
+
+echo "Flushing PCIe profiler to disk (stop_profile)..."
+curl -s -X POST "http://localhost:$API_PORT/stop_profile" >/dev/null || true
+sleep 3
 
 # 收集 baseline PCIe 事件
 PCIE_FILES=$(ls "$PCIE_PROFILER_DIR"/pcie_events_*.json 2>/dev/null || true)
