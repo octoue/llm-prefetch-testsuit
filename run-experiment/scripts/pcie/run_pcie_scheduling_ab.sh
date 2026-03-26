@@ -13,6 +13,7 @@
 # 示例:
 #   ./run_pcie_scheduling_ab.sh pcie-medium
 #   ./run_pcie_scheduling_ab.sh pcie-heavy --qps 3.0
+#   ./run_pcie_scheduling_ab.sh pcie-medium --pp-phase-h2d-policy hard
 #   ./run_pcie_scheduling_ab.sh pcie-full   # 直接使用 data/qwen_traceA_blksz_16.jsonl（与 medium 同参数范式）
 #
 # 注意: Phase 1 前用 ./start_vllm_pcie.sh（不要加 --pcie-scheduler）；
@@ -33,9 +34,10 @@ source scripts/utils/common.sh
 DATASET="${1:-pcie-medium}"
 shift 2>/dev/null || true
 
-# 解析选项
+# 解析选项（与 start_vllm_pcie.sh 的 --pp-phase-h2d-policy 一致，用于报告/汇总表记录 Phase 3 配置）
 NO_TENSORBOARD=0
 NUM_GPU_BLOCKS_OVERRIDE_SET=0
+PP_PHASE_H2D_POLICY=soft
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -45,11 +47,24 @@ while [[ $# -gt 0 ]]; do
             PREFETCH_LEAD_TIME="$2"; shift 2 ;;
         --gpu-blocks)
             NUM_GPU_BLOCKS_OVERRIDE="$2"; NUM_GPU_BLOCKS_OVERRIDE_SET=1; shift 2 ;;
+        --pp-phase-h2d-policy)
+            if [[ $# -lt 2 ]]; then
+                echo "❌ --pp-phase-h2d-policy 需要参数: soft | hard | restore_only"
+                exit 1
+            fi
+            PP_PHASE_H2D_POLICY="$2"
+            case "$PP_PHASE_H2D_POLICY" in
+                soft|hard|restore_only) ;;
+                *)
+                    echo "❌ --pp-phase-h2d-policy 必须是 soft、hard 或 restore_only，收到: $PP_PHASE_H2D_POLICY"
+                    exit 1 ;;
+            esac
+            shift 2 ;;
         --no-tensorboard)
             NO_TENSORBOARD=1; shift ;;
         *)
             echo "❌ Unknown option: $1"
-            echo "Usage: $0 [dataset] [--qps N] [--lead-time N] [--gpu-blocks N] [--no-tensorboard]"
+            echo "Usage: $0 [dataset] [--qps N] [--lead-time N] [--gpu-blocks N] [--pp-phase-h2d-policy soft|hard|restore_only] [--no-tensorboard]"
             exit 1 ;;
     esac
 done
@@ -87,6 +102,7 @@ echo "Num conversations: $NUM_CONV"
 echo "QPS: $QPS"
 echo "Prefetch lead time: ${PREFETCH_LEAD_TIME}s"
 echo "GPU blocks: $NUM_GPU_BLOCKS_OVERRIDE"
+echo "PP phase H2D policy (Phase 3 须与 start_vllm_pcie.sh 一致): $PP_PHASE_H2D_POLICY"
 echo "Experiment ID: $EXP_ID"
 echo "Results: $RESULTS_DIR"
 echo "Summary TSV: $TSV_SUMMARY"
@@ -233,7 +249,11 @@ echo ""
 print_separator
 echo "⚠️  Please RESTART vLLM WITH PCIe scheduler for Phase 3:"
 echo "   1. Stop current vLLM (Ctrl+C)"
-echo "   2. Start: ./start_vllm_pcie.sh --pcie-scheduler"
+if [[ "$PP_PHASE_H2D_POLICY" == "soft" ]]; then
+    echo "   2. Start: ./start_vllm_pcie.sh --pcie-scheduler"
+else
+    echo "   2. Start: ./start_vllm_pcie.sh --pcie-scheduler --pp-phase-h2d-policy $PP_PHASE_H2D_POLICY"
+fi
 echo "   3. Press Enter here to continue Phase 3"
 print_separator
 read -r
@@ -321,6 +341,7 @@ if [[ -f "../result-analysis/pcie_scheduling_ab_finalize.py" ]]; then
         --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-}" \
         --vllm-pipeline-parallel-size "${VLLM_PIPELINE_PARALLEL_SIZE:-}" \
         --vllm-max-num-seqs "${VLLM_MAX_NUM_SEQS:-}" \
+        --pp-phase-h2d-policy "$PP_PHASE_H2D_POLICY" \
         --md-output "$RESULTS_DIR/experiment_report.md" \
         --tsv-path "$TSV_SUMMARY" \
         && echo "✓ Merged report: $RESULTS_DIR/experiment_report.md" \

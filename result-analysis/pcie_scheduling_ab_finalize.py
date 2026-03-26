@@ -89,6 +89,7 @@ def _format_config_md(
         ("gpu_memory_utilization", "GPU_MEMORY_UTILIZATION"),
         ("vllm_pipeline_parallel_size", "VLLM_PIPELINE_PARALLEL_SIZE"),
         ("vllm_max_num_seqs", "VLLM_MAX_NUM_SEQS"),
+        ("pp_phase_h2d_policy", "PP_PHASE_H2D_POLICY"),
     ]
     lines = [
         "## 1. 配置与实验标识",
@@ -393,6 +394,7 @@ def build_tsv_header() -> list[str]:
         "gpu_memory_utilization",
         "vllm_pipeline_parallel_size",
         "vllm_max_num_seqs",
+        "pp_phase_h2d_policy",
     ]
     phases = ["plain", "prefetch", "pcie_sched"]
 
@@ -464,6 +466,7 @@ def build_row_dict(
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "vllm_pipeline_parallel_size": args.vllm_pipeline_parallel_size,
         "vllm_max_num_seqs": args.vllm_max_num_seqs,
+        "pp_phase_h2d_policy": args.pp_phase_h2d_policy,
     }
     row.update(tsv_ttft)
     row.update(tsv_pcie)
@@ -483,6 +486,12 @@ def main() -> None:
     parser.add_argument("--gpu-memory-utilization", required=True)
     parser.add_argument("--vllm-pipeline-parallel-size", required=True)
     parser.add_argument("--vllm-max-num-seqs", required=True)
+    parser.add_argument(
+        "--pp-phase-h2d-policy",
+        default="soft",
+        choices=["soft", "hard", "restore_only"],
+        help="与 Phase 3 start_vllm_pcie.sh 使用的 --pp-phase-h2d-policy 一致（vLLM SchedulerConfig）",
+    )
     parser.add_argument(
         "--md-output",
         default="",
@@ -518,6 +527,7 @@ def main() -> None:
         "gpu_memory_utilization": str(args.gpu_memory_utilization),
         "vllm_pipeline_parallel_size": str(args.vllm_pipeline_parallel_size),
         "vllm_max_num_seqs": str(args.vllm_max_num_seqs),
+        "pp_phase_h2d_policy": str(args.pp_phase_h2d_policy),
     }
 
     tsv_ttft, md_ttft = _ttft_tpot_tsv_and_md(

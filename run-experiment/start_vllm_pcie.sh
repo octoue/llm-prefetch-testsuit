@@ -1,9 +1,10 @@
 #!/bin/bash
 # vLLM 启动脚本（PCIe Profiling 版）
 # 在 start_vllm.sh 基础上增加：禁用 NVLink、轻量 PCIe Profiler（仅 PCIeTracer，无 torch 开销）
-# 用法: ./start_vllm_pcie.sh [medium|--pcie-scheduler]
+# 用法: ./start_vllm_pcie.sh [medium|--pcie-scheduler] [--pp-phase-h2d-policy soft|hard|restore_only]
 #   medium: 仅提示，与默认共用 NUM_GPU_BLOCKS_OVERRIDE
 #   --pcie-scheduler: 启用 PCIe 调度算法 (VLLM_PCIE_SCHEDULER=1)，用于 run_pcie_scheduling_ab.sh 的 Phase 3
+#   --pp-phase-h2d-policy: 传给 vllm 的 PP phase H2D 策略（默认 soft，与 vLLM SchedulerConfig 一致）
 # 配合 run_pcie_scheduling_ab.sh 使用（Phase 1～2 请勿加此选项）
 
 set -e
@@ -14,6 +15,7 @@ cd "$SCRIPT_DIR"
 # 解析可选参数
 PCIE_SCHEDULER=0
 NO_PP_PHASE_AWARE=0  # 消融实验：禁用 PP Phase 感知，仅验证双队列+Evict-first
+PP_PHASE_H2D_POLICY=soft
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --pcie-scheduler)
@@ -22,6 +24,19 @@ while [[ $# -gt 0 ]]; do
         --no-pp-phase-aware)
             NO_PP_PHASE_AWARE=1
             shift ;;
+        --pp-phase-h2d-policy)
+            if [[ $# -lt 2 ]]; then
+                echo "错误: --pp-phase-h2d-policy 需要参数: soft | hard | restore_only"
+                exit 1
+            fi
+            PP_PHASE_H2D_POLICY="$2"
+            case "$PP_PHASE_H2D_POLICY" in
+                soft|hard|restore_only) ;;
+                *)
+                    echo "错误: --pp-phase-h2d-policy 必须是 soft、hard 或 restore_only，收到: $PP_PHASE_H2D_POLICY"
+                    exit 1 ;;
+            esac
+            shift 2 ;;
         medium)
             shift ;;
         *)
@@ -78,6 +93,7 @@ echo "Model: $MODEL_PATH (local, HF_HUB_OFFLINE=1)"
 echo "KV_OFFLOADING_SIZE=${KV_OFFLOADING_SIZE}, SWAP_SPACE=${SWAP_SPACE}"
 echo "Profiler 输出: $PCIE_PROFILER_DIR"
 echo "VLLM_PCIE_TRACE=1, NCCL_P2P_DISABLE=1"
+echo "PP_PHASE_H2D_POLICY=$PP_PHASE_H2D_POLICY (--pp-phase-h2d-policy)"
 [[ "$PCIE_SCHEDULER" -eq 1 ]] && echo "VLLM_PCIE_SCHEDULER=1 (PCIe scheduling enabled)"
 echo "============================================"
 
@@ -108,6 +124,8 @@ if [ -n "$KV_OFFLOADING_SIZE" ] && [ "$KV_OFFLOADING_SIZE" != "0" ]; then
   CMD_ARGS+=(--swap-space "$SWAP_SPACE")
   echo "KV Offloading enabled: ${KV_OFFLOADING_SIZE} GiB"
 fi
+
+CMD_ARGS+=(--pp-phase-h2d-policy "$PP_PHASE_H2D_POLICY")
 
 if [ "$PCIE_SCHEDULER" -eq 1 ]; then
   CMD_ARGS+=(--enable-pcie-scheduling)
