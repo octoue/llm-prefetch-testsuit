@@ -114,8 +114,14 @@ if [ "$PCIE_SCHEDULER" -eq 1 ]; then
   CMD_ARGS+=(--max-concurrent-h2d 2)
   CMD_ARGS+=(--prefetch-block-threshold 150)
   CMD_ARGS+=(--max-queue-wait-ms 30)
+  # Optimization 1: Dynamic H2D concurrency control
+  CMD_ARGS+=(--adaptive-h2d-concurrency)
+  CMD_ARGS+=(--adaptive-h2d-high-load-threshold 5)
+  CMD_ARGS+=(--adaptive-h2d-high-load-concurrency 4)
+  # Optimization 2: End-to-end starvation monitoring
+  CMD_ARGS+=(--max-transfer-wait-ms 500)
   [[ "$NO_PP_PHASE_AWARE" -eq 1 ]] && CMD_ARGS+=(--no-enable-pp-phase-aware) && echo "Ablation: PP-phase-aware disabled"
-  echo "PCIe Scheduling parameters added to vLLM args"
+  echo "PCIe Scheduling parameters added to vLLM args (with dynamic concurrency & e2e monitoring)"
 fi
 
 export VLLM_LOGGING_LEVEL="${VLLM_LOG_LEVEL:-INFO}"
