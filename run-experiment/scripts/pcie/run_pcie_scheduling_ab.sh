@@ -2,7 +2,13 @@
 # PCIe 调度 A/B 实验脚本
 #
 # 对比 VLLM_PCIE_SCHEDULER=1（启用）与 未启用 两种配置下的 Prefetch 表现。
-# 实验流程：Phase 1 启用调度 → Phase 2 未启用 → Phase 3 生成对比报告
+# 实验流程：Phase 1 启用调度 → Phase 2 未启用 → Phase 3 生成合并 Markdown + 追加 TSV 汇总表
+#
+# 产物：
+#   - 单次实验目录：<repo>/results/<实验辨识码>/（jsonl、log、pcie json 等，与旧版相同文件名）
+#   - 合并报告：pcie_scheduling_ab_report.md（原 ttft_report + pcie_scheduling_report 拼接，中间 ---）
+#   - 全实验 TSV：<repo>/results/pcie_scheduling_experiments.txt（制表符分隔，可粘贴 Excel）
+#   不在实验目录写入 config_snapshot.env；报告用临时 key=value 文件生成。
 #
 # 用法:
 #   ./run_pcie_scheduling_ab.sh [dataset] [options]
@@ -58,8 +64,36 @@ load_dataset_config "$DATASET"
 # 检查数据集
 generate_dataset_if_needed "$TRACE" "$FULL_TRACE" "$DATASET" || exit 1
 
-# 结果目录
-RESULTS_DIR="$RESULTS_ROOT/pcie_sched_${DATASET}_qps${QPS}_lead${PREFETCH_LEAD_TIME}"
+# 仓库根目录（llm-prefetch-testsuit）与固定汇总表路径
+RUN_EXP_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+MASTER_TABLE_TSV="$REPO_ROOT/results/pcie_scheduling_experiments.txt"
+
+# 实验辨识码：时间 + 数据集 + 关键参数 + 模型规模（便于区分历次实验）
+EXP_TS="$(date +%Y%m%d_%H%M%S)"
+MODEL_TAG="$(python3 -c "
+import re, sys
+p = sys.argv[1].lower()
+checks = [
+    (r'(?<![0-9.])72b(?![0-9])', '72B'),
+    (r'(?<![0-9.])32b(?![0-9])', '32B'),
+    (r'(?<![0-9.])8b(?![0-9])', '8B'),
+]
+for pat, lab in checks:
+    if re.search(pat, p):
+        print(lab)
+        break
+else:
+    print('unknown')
+" "$MODEL_PATH")"
+
+EXP_ID="${EXP_TS}_${DATASET}_q${QPS}_lead${PREFETCH_LEAD_TIME}_${MODEL_TAG}"
+EXP_ID="${EXP_ID//\//_}"
+EXP_ID="${EXP_ID// /_}"
+
+# 单次实验产物目录：results/<实验辨识码>/
+mkdir -p "$REPO_ROOT/results"
+RESULTS_DIR="$REPO_ROOT/results/$EXP_ID"
 mkdir -p "$RESULTS_DIR"
 
 # Profiler 目录改为绝对路径（与 start_vllm_pcie.sh 一致），便于清空与收集
@@ -72,13 +106,15 @@ mkdir -p "$PCIE_PROFILER_DIR"
 print_separator
 echo "PCIe Scheduling A/B Experiment"
 print_separator
+echo "Experiment ID: $EXP_ID"
 echo "Dataset: $DATASET"
 echo "Trace: $TRACE"
 echo "Num conversations: $NUM_CONV"
 echo "QPS: $QPS"
 echo "Prefetch lead time: ${PREFETCH_LEAD_TIME}s"
 echo "GPU blocks: $NUM_GPU_BLOCKS_OVERRIDE"
-echo "Results: $RESULTS_DIR"
+echo "Run directory: $RESULTS_DIR"
+echo "Master TSV (all runs): $MASTER_TABLE_TSV"
 print_separator
 
 # ------------------------------------------------------------------
@@ -229,64 +265,90 @@ fi
 [[ -f "$VLLM_LOG" ]] && cp "$VLLM_LOG" "$RESULTS_DIR/vllm_state_baseline.log" 2>/dev/null || true
 
 # ------------------------------------------------------------------
-# Phase 3: 生成对比报告
+# Phase 3: 生成合并 Markdown 报告 + 追加 TSV 汇总行（不写 results 下的 config_snapshot.env）
 # ------------------------------------------------------------------
 print_phase "[Phase 3/3] Generating comparison report..."
 
-# 先保存完整配置快照（供报告和 generate_report 使用）
-{
-    echo "# PCIe Scheduling A/B Experiment - 完整配置快照"
-    echo ""
-    echo "# ========== 实验运行时参数 =========="
-    echo "DATASET=$DATASET"
-    echo "QPS=$QPS"
-    echo "PREFETCH_LEAD_TIME=$PREFETCH_LEAD_TIME"
-    echo "NUM_GPU_BLOCKS_OVERRIDE=$NUM_GPU_BLOCKS_OVERRIDE"
-    echo "TRACE=$TRACE"
-    echo "FULL_TRACE=$FULL_TRACE"
-    echo "NUM_CONV=$NUM_CONV"
-    echo "MODEL_PATH=$MODEL_PATH"
-    echo ""
-    echo "# ========== system.env =========="
-    cat config/system.env 2>/dev/null || true
-    echo ""
-    echo "# ========== experiments.env =========="
-    cat config/experiments.env 2>/dev/null || true
-    echo ""
-    echo "# ========== datasets.env (当前数据集: $DATASET) =========="
-    DS_PREFIX="DATASET_$(echo ${DATASET//-/_} | tr '[:lower:]' '[:upper:]')_"
-    grep -E "^DATA_ROOT=|^${DS_PREFIX}" config/datasets.env 2>/dev/null || cat config/datasets.env 2>/dev/null || true
-} > "$RESULTS_DIR/config_snapshot.env"
-bash dump_config.sh >> "$RESULTS_DIR/config_snapshot.env" 2>/dev/null || true
+CONFIG_TMP=$(mktemp)
+TTFT_PART=$(mktemp)
+PCIE_PART=$(mktemp)
+cleanup_phase3_tmp() {
+    rm -f "$CONFIG_TMP" "$TTFT_PART" "$PCIE_PART"
+}
+trap cleanup_phase3_tmp EXIT
 
-# 使用 generate_report 做 TTFT/TPOT 对比（传入配置文件以修复配置详情为空）
+# 临时 key=value 配置（仅用于报告生成，不落盘到实验目录）
+# grep 在无匹配时返回 1，需吞掉以免 set -e 中断
+DATASET="$DATASET" QPS="$QPS" PREFETCH_LEAD_TIME="$PREFETCH_LEAD_TIME" \
+    NUM_GPU_BLOCKS_OVERRIDE="$NUM_GPU_BLOCKS_OVERRIDE" TRACE="$TRACE" FULL_TRACE="$FULL_TRACE" \
+    NUM_CONV="$NUM_CONV" MODEL_PATH="$MODEL_PATH" \
+    RUN_EXPERIMENT_DIR="$RUN_EXP_ROOT" bash "$RUN_EXP_ROOT/dump_config.sh" 2>/dev/null \
+    | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' > "$CONFIG_TMP" || true
+
 python3 ../result-analysis/generate_report.py \
     --baseline "$RESULTS_DIR/prefetch_baseline.jsonl" \
     --prefetch "$RESULTS_DIR/prefetch_pcie_sched.jsonl" \
-    --output "$RESULTS_DIR/ttft_report.md" \
-    --config-file "$RESULTS_DIR/config_snapshot.env" \
-    2>/dev/null && echo "✓ TTFT report: $RESULTS_DIR/ttft_report.md" || true
+    --output "$TTFT_PART" \
+    --config-file "$CONFIG_TMP" \
+    2>/dev/null && echo "✓ Prefetch A/B section (temp)" || echo "⚠️  generate_report.py failed"
 
-# 使用 PCIe 调度专用报告生成器（含 config、PCIe 带宽等）
 if [[ -f "../result-analysis/generate_pcie_scheduling_report.py" ]]; then
     python3 ../result-analysis/generate_pcie_scheduling_report.py \
         --results-dir "$RESULTS_DIR" \
         --dataset "$DATASET" \
         --qps "$QPS" \
         --lead-time "$PREFETCH_LEAD_TIME" \
-        --output "$RESULTS_DIR/pcie_scheduling_report.md" \
-        2>/dev/null && echo "✓ PCIe scheduling report: $RESULTS_DIR/pcie_scheduling_report.md" || \
-        echo "⚠️  generate_pcie_scheduling_report.py failed (optional)"
+        --config-file "$CONFIG_TMP" \
+        --output "$PCIE_PART" \
+        2>/dev/null && echo "✓ PCIe scheduling section (temp)" || \
+        echo "⚠️  generate_pcie_scheduling_report.py failed"
 else
-    echo "⚠️  generate_pcie_scheduling_report.py not found, skipping enhanced report"
+    echo "⚠️  generate_pcie_scheduling_report.py not found, PCIe section omitted"
+fi
+
+MERGED_MD="$RESULTS_DIR/pcie_scheduling_ab_report.md"
+{
+    if [[ -s "$TTFT_PART" ]]; then
+        cat "$TTFT_PART"
+    fi
+    echo ""
+    echo "---"
+    echo ""
+    if [[ -s "$PCIE_PART" ]]; then
+        cat "$PCIE_PART"
+    fi
+} > "$MERGED_MD"
+echo "✓ Merged report: $MERGED_MD"
+
+cleanup_phase3_tmp
+trap - EXIT
+
+if [[ -f "../result-analysis/append_pcie_scheduling_summary_row.py" ]]; then
+    python3 ../result-analysis/append_pcie_scheduling_summary_row.py \
+        --results-dir "$RESULTS_DIR" \
+        --exp-id "$EXP_ID" \
+        --dataset "$DATASET" \
+        --qps "$QPS" \
+        --lead-time "$PREFETCH_LEAD_TIME" \
+        --num-gpu-blocks "$NUM_GPU_BLOCKS_OVERRIDE" \
+        --num-conv "$NUM_CONV" \
+        --gpu-mem-util "$GPU_MEMORY_UTILIZATION" \
+        --vllm-pp "$VLLM_PIPELINE_PARALLEL_SIZE" \
+        --vllm-max-num-seqs "$VLLM_MAX_NUM_SEQS" \
+        --model-path "$MODEL_PATH" \
+        --table "$MASTER_TABLE_TSV" \
+        && echo "✓ Appended row to $MASTER_TABLE_TSV" || \
+        echo "⚠️  append_pcie_scheduling_summary_row.py failed"
+else
+    echo "⚠️  append_pcie_scheduling_summary_row.py not found, skip TSV append"
 fi
 
 echo ""
 echo "✅ PCIe Scheduling A/B experiment complete!"
 echo ""
 echo "Results:"
-echo "  Directory: $RESULTS_DIR"
-echo "  TTFT report: $RESULTS_DIR/ttft_report.md"
-echo "  PCIe scheduling report: $RESULTS_DIR/pcie_scheduling_report.md"
-echo "  Logs: prefetch_pcie_sched.log, prefetch_baseline.log"
+echo "  Run directory: $RESULTS_DIR"
+echo "  Merged report: $MERGED_MD"
+echo "  Master TSV:    $MASTER_TABLE_TSV"
+echo "  Logs / jsonl:  prefetch_*.log, prefetch_*.jsonl, pcie_events_*.json, vllm_state_*.log"
 print_separator

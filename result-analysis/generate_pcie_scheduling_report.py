@@ -142,13 +142,19 @@ def main() -> None:
     parser.add_argument("--dataset", default="", help="Dataset name")
     parser.add_argument("--qps", default="", help="QPS value")
     parser.add_argument("--lead-time", default="", help="Prefetch lead time")
+    parser.add_argument(
+        "--config-file",
+        default="",
+        help="配置快照路径（key=value）；不指定则使用 results-dir/config_snapshot.env",
+    )
     parser.add_argument("--output", required=True, help="Output markdown path")
     args = parser.parse_args()
 
     base = Path(args.results_dir)
     pcie_sched = load_jsonl(base / "prefetch_pcie_sched.jsonl")
     baseline = load_jsonl(base / "prefetch_baseline.jsonl")
-    config = load_config(base / "config_snapshot.env")
+    cfg_path = Path(args.config_file) if args.config_file else base / "config_snapshot.env"
+    config = load_config(cfg_path)
 
     ttft_pcie = compute_ttft_stats(pcie_sched)
     ttft_base = compute_ttft_stats(baseline)
