@@ -18,6 +18,10 @@
 #
 # 注意: Phase 1 前用 ./start_vllm_pcie.sh（不要加 --pcie-scheduler）；
 #       Phase 2 结束后重启 vLLM 并加 --pcie-scheduler 再跑 Phase 3。
+#
+# 论文/消融三组（分别跑完整脚本或对应 Phase）：
+#   A: --pcie-scheduler（默认 idle_only） vs B: --pcie-scheduler --pp-phase-h2d-policy soft
+#   C: 无 --pcie-scheduler（Prefetch-only baseline）
 
 set -e
 
@@ -37,7 +41,7 @@ shift 2>/dev/null || true
 # 解析选项（与 start_vllm_pcie.sh 的 --pp-phase-h2d-policy 一致，用于报告/汇总表记录 Phase 3 配置）
 NO_TENSORBOARD=0
 NUM_GPU_BLOCKS_OVERRIDE_SET=0
-PP_PHASE_H2D_POLICY=soft
+PP_PHASE_H2D_POLICY=idle_only
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -49,14 +53,14 @@ while [[ $# -gt 0 ]]; do
             NUM_GPU_BLOCKS_OVERRIDE="$2"; NUM_GPU_BLOCKS_OVERRIDE_SET=1; shift 2 ;;
         --pp-phase-h2d-policy)
             if [[ $# -lt 2 ]]; then
-                echo "❌ --pp-phase-h2d-policy 需要参数: soft | hard | restore_only"
+                echo "❌ --pp-phase-h2d-policy 需要参数: idle_only | soft | hard | restore_only"
                 exit 1
             fi
             PP_PHASE_H2D_POLICY="$2"
             case "$PP_PHASE_H2D_POLICY" in
-                soft|hard|restore_only) ;;
+                idle_only|soft|hard|restore_only) ;;
                 *)
-                    echo "❌ --pp-phase-h2d-policy 必须是 soft、hard 或 restore_only，收到: $PP_PHASE_H2D_POLICY"
+                    echo "❌ --pp-phase-h2d-policy 必须是 idle_only、soft、hard 或 restore_only，收到: $PP_PHASE_H2D_POLICY"
                     exit 1 ;;
             esac
             shift 2 ;;
@@ -64,7 +68,7 @@ while [[ $# -gt 0 ]]; do
             NO_TENSORBOARD=1; shift ;;
         *)
             echo "❌ Unknown option: $1"
-            echo "Usage: $0 [dataset] [--qps N] [--lead-time N] [--gpu-blocks N] [--pp-phase-h2d-policy soft|hard|restore_only] [--no-tensorboard]"
+            echo "Usage: $0 [dataset] [--qps N] [--lead-time N] [--gpu-blocks N] [--pp-phase-h2d-policy idle_only|soft|hard|restore_only] [--no-tensorboard]"
             exit 1 ;;
     esac
 done
@@ -249,7 +253,7 @@ echo ""
 print_separator
 echo "⚠️  Please RESTART vLLM WITH PCIe scheduler for Phase 3:"
 echo "   1. Stop current vLLM (Ctrl+C)"
-if [[ "$PP_PHASE_H2D_POLICY" == "soft" ]]; then
+if [[ "$PP_PHASE_H2D_POLICY" == "idle_only" ]]; then
     echo "   2. Start: ./start_vllm_pcie.sh --pcie-scheduler"
 else
     echo "   2. Start: ./start_vllm_pcie.sh --pcie-scheduler --pp-phase-h2d-policy $PP_PHASE_H2D_POLICY"

@@ -488,8 +488,8 @@ def main() -> None:
     parser.add_argument("--vllm-max-num-seqs", required=True)
     parser.add_argument(
         "--pp-phase-h2d-policy",
-        default="soft",
-        choices=["soft", "hard", "restore_only"],
+        default="idle_only",
+        choices=["idle_only", "soft", "hard", "restore_only"],
         help="与 Phase 3 start_vllm_pcie.sh 使用的 --pp-phase-h2d-policy 一致（vLLM SchedulerConfig）",
     )
     parser.add_argument(
