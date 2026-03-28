@@ -80,7 +80,9 @@ def main():
               f"active_ms={total_ms:.1f}, bw_GBps={bw:.2f}, gpus={dict(by_gpu)}")
 
     # 重叠：Prefetch/Restore/Evict vs PP_*
-    pp_ops = {"PP_P2P_Send", "PP_P2P_Recv", "PP_TP_AllGather_Reconstruct", "PP_Transfer"}
+    # Exclude PP_P2P_Recv: its duration includes NCCL blocking wait (~24ms),
+    # not actual PCIe transfer time. PP_P2P_Send reflects true PCIe occupancy.
+    pp_ops = {"PP_P2P_Send", "PP_TP_AllGather_Reconstruct"}
     pp_events = [e for e in events if e["op_type"] in pp_ops]
     for target in ["Evict", "Restore", "Prefetch"]:
         t_events = by_op.get(target, [])
