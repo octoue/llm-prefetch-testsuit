@@ -41,7 +41,10 @@ function load_dataset_config() {
 
     echo "✓ Loaded dataset config: $dataset"
     echo "  Trace: $TRACE"
-    echo "  Num conversations: $NUM_CONV"
+    # pcie-full / pcie-trace-a-light 在 run_pcie_scheduling_ab.sh 中按 trace 统计多轮根后再打印 NUM_CONV
+    if [[ "$dataset" != "pcie-full" && "$dataset" != "pcie-trace-a-light" ]]; then
+        echo "  Num conversations: $NUM_CONV"
+    fi
     echo "  GPU blocks (recommended): $DATASET_GPU_BLOCKS"
 }
 
@@ -80,9 +83,13 @@ function generate_dataset_if_needed() {
     echo "⚠️  Dataset not found: $trace"
     echo "Generating from: $full_trace"
 
-    # 从dataset名称提取preset
+    # 从 dataset 名称提取 preset（pcie-trace-a-light 名中含 lite 子串，勿误判为 pcie_stress lite）
     local preset=""
-    if [[ "$dataset_name" == *"lite"* ]]; then
+    if [[ "$dataset_name" == "pcie-trace-a-light" ]]; then
+        echo "❌ Error: 缺少 Trace A 分层轻量化文件: $trace"
+        echo "   请在仓库根目录生成: python3 result-analysis/sample_trace_stratified.py --input data/qwen_traceA_blksz_16.jsonl --output data/qwen_traceA_blksz_16_light_stratified.jsonl --report result-analysis/qwen_traceA_blksz_16_light_report.md"
+        return 1
+    elif [[ "$dataset_name" == *"lite"* ]]; then
         preset="lite"
     elif [[ "$dataset_name" == *"medium"* ]]; then
         preset="medium"

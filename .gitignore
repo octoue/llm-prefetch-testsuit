@@ -3,3 +3,8 @@
 runs/
 results/
 docs/
+result-analysis/qwen_traceA_blksz_16_light_report.md
+run-experiment/profiler_output/pcie_events_0.json
+run-experiment/profiler_output/pcie_events_1.json
+run-experiment/vllm_state.log
+.claude/

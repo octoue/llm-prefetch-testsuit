@@ -16,7 +16,8 @@
 # 示例:
 #   ./run_pcie_scheduling_ab.sh pcie-medium
 #   ./run_pcie_scheduling_ab.sh pcie-heavy --qps 3.0
-#   ./run_pcie_scheduling_ab.sh pcie-full   # 直接使用 data/qwen_traceA_blksz_16.jsonl（与 medium 同参数范式）
+#   ./run_pcie_scheduling_ab.sh pcie-full   # 完整 qwen trace，全量多轮根 + 与 heavy 同档 GPU 块压力；实验不设总 timeout
+#   ./run_pcie_scheduling_ab.sh pcie-trace-a-light   # Trace A 分层轻量化 JSONL，NUM_CONV 自 trace 统计；不设总 timeout
 #
 # 注意: 需在 Phase 1 前用 start_vllm_pcie.sh --pcie-scheduler 启动 vLLM；
 #       Phase 1 结束后需重启 vLLM（不用 --pcie-scheduler）再继续 Phase 2。
@@ -63,6 +64,50 @@ load_dataset_config "$DATASET"
 
 # 检查数据集
 generate_dataset_if_needed "$TRACE" "$FULL_TRACE" "$DATASET" || exit 1
+
+# pcie-full / pcie-trace-a-light：全量多轮对话根（与 prefetch_ab_runner._analyze_conversations 一致），从 TRACE 统计 NUM_CONV
+PCIE_FULL_RUNNER_TIMEOUT_ARGS=(--timeout "$TIMEOUT" --request-timeout "$REQUEST_TIMEOUT")
+if [[ "$DATASET" == "pcie-full" || "$DATASET" == "pcie-trace-a-light" ]]; then
+    if [[ ! -f "$TRACE" ]]; then
+        echo "❌ $DATASET: trace 不存在: $TRACE"
+        exit 1
+    fi
+    # 行级文本统计（不解析 JSON）：parent_chat_id=-1 的根且至少有一条子记录引用其 chat_id → 多轮根
+    NUM_CONV=$(
+        awk '
+        index($0, "\"parent_chat_id\": -1") > 0 {
+            if (match($0, /"chat_id": [0-9]+/)) {
+                cid = substr($0, RSTART+11, RLENGTH-11)
+                isroot[cid] = 1
+            }
+        }
+        {
+            idx = index($0, "\"parent_chat_id\": ")
+            if (idx == 0) next
+            rest = substr($0, idx + length("\"parent_chat_id\": "))
+            if (length(rest) == 0 || substr(rest, 1, 1) == "-") next
+            if (match(rest, /^[0-9]+/)) {
+                pid = substr(rest, 1, RLENGTH)
+                haschild[pid] = 1
+            }
+        }
+        END {
+            n = 0
+            for (c in isroot) if (c in haschild) n++
+            print n
+        }
+        ' "$TRACE"
+    )
+    if [[ -z "${NUM_CONV// /}" || ! "$NUM_CONV" =~ ^[0-9]+$ || "$NUM_CONV" -eq 0 ]]; then
+        echo "❌ $DATASET: 无法从 trace 统计多轮对话根数量: $TRACE"
+        exit 1
+    fi
+    echo "✓ $DATASET: 全量多轮根数量 NUM_CONV=$NUM_CONV（自 trace 统计）"
+    # 与 heavy 类似的显存/换块压力；总时长由 runner 跑完全部 workload（不传实验级 --timeout）
+    REQUEST_TIMEOUT=360
+    TIMEOUT=""
+    PCIE_FULL_RUNNER_TIMEOUT_ARGS=(--request-timeout "$REQUEST_TIMEOUT")
+fi
 
 # 仓库根目录（llm-prefetch-testsuit）与固定汇总表路径
 RUN_EXP_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -113,6 +158,11 @@ echo "Num conversations: $NUM_CONV"
 echo "QPS: $QPS"
 echo "Prefetch lead time: ${PREFETCH_LEAD_TIME}s"
 echo "GPU blocks: $NUM_GPU_BLOCKS_OVERRIDE"
+if [[ "$DATASET" == "pcie-full" || "$DATASET" == "pcie-trace-a-light" ]]; then
+    echo "Runner timeouts: ${PCIE_FULL_RUNNER_TIMEOUT_ARGS[*]} (no global phase timeout)"
+else
+    echo "Runner timeouts: TIMEOUT=${TIMEOUT}s REQUEST_TIMEOUT=${REQUEST_TIMEOUT}s"
+fi
 echo "Run directory: $RESULTS_DIR"
 echo "Master TSV (all runs): $MASTER_TABLE_TSV"
 print_separator
@@ -151,8 +201,7 @@ python3 prefetch_ab_runner.py \
     --api-base "http://localhost:$API_PORT/v1" \
     --output "$RESULTS_DIR/prefetch_pcie_sched.jsonl" \
     --seed "$SEED" \
-    --timeout "$TIMEOUT" \
-    --request-timeout "$REQUEST_TIMEOUT" \
+    "${PCIE_FULL_RUNNER_TIMEOUT_ARGS[@]}" \
     --prefetch-lead-time "$PREFETCH_LEAD_TIME" \
     --schedule-mode "$SCHEDULE_MODE" \
     "${TB_ARGS[@]}" \
@@ -231,8 +280,7 @@ python3 prefetch_ab_runner.py \
     --api-base "http://localhost:$API_PORT/v1" \
     --output "$RESULTS_DIR/prefetch_baseline.jsonl" \
     --seed "$SEED" \
-    --timeout "$TIMEOUT" \
-    --request-timeout "$REQUEST_TIMEOUT" \
+    "${PCIE_FULL_RUNNER_TIMEOUT_ARGS[@]}" \
     --prefetch-lead-time "$PREFETCH_LEAD_TIME" \
     --schedule-mode "$SCHEDULE_MODE" \
     "${TB_ARGS[@]}" \
@@ -282,6 +330,7 @@ trap cleanup_phase3_tmp EXIT
 DATASET="$DATASET" QPS="$QPS" PREFETCH_LEAD_TIME="$PREFETCH_LEAD_TIME" \
     NUM_GPU_BLOCKS_OVERRIDE="$NUM_GPU_BLOCKS_OVERRIDE" TRACE="$TRACE" FULL_TRACE="$FULL_TRACE" \
     NUM_CONV="$NUM_CONV" MODEL_PATH="$MODEL_PATH" \
+    TIMEOUT="${TIMEOUT:-}" REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-}" \
     RUN_EXPERIMENT_DIR="$RUN_EXP_ROOT" bash "$RUN_EXP_ROOT/dump_config.sh" 2>/dev/null \
     | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' > "$CONFIG_TMP" || true
 
