@@ -8,3 +8,4 @@ run-experiment/profiler_output/pcie_events_0.json
 run-experiment/profiler_output/pcie_events_1.json
 run-experiment/vllm_state.log
 .claude/
+.DS_Store
