@@ -49,6 +49,7 @@ class PrefetchABRunner:
         prefetch_lead_time: float = 0.2,
         seed: int = 42,
         request_timeout: Optional[float] = None,
+        max_output_tokens: Optional[int] = None,
     ):
         self.trace_file = trace_file
         self.api_base = api_base
@@ -57,6 +58,7 @@ class PrefetchABRunner:
         self.prefetch_lead_time = prefetch_lead_time  # prefetch 提前量（秒），在 scheduled_time - lead_time 发送
         self.seed = seed
         self.request_timeout = request_timeout  # 仅轻量化测试使用，None 时保持 OpenAI 默认 600s
+        self.max_output_tokens = max_output_tokens  # 限制单请求最大生成 token 数
 
         # 在 seed 设置后生成单词池，确保两次运行生成完全相同的文本
         random.seed(seed)
@@ -381,7 +383,10 @@ class PrefetchABRunner:
             )
             messages.append({"role": "user", "content": user_msg})
 
-            result = await self._send_streaming_request(messages, record["output_length"])
+            output_tokens = record["output_length"]
+            if self.max_output_tokens is not None:
+                output_tokens = min(output_tokens, self.max_output_tokens)
+            result = await self._send_streaming_request(messages, output_tokens)
 
             if result["success"] and result.get("text"):
                 messages.append({"role": "assistant", "content": result["text"]})
@@ -389,7 +394,7 @@ class PrefetchABRunner:
                 messages.append({
                     "role": "assistant",
                     "content": self._generate_text_with_tokens(
-                        record["output_length"],
+                        output_tokens,
                         chat_id=record["chat_id"],
                         turn=record["turn"],
                         placeholder=True,
@@ -541,6 +546,8 @@ async def main():
     parser.add_argument("--timeout", type=float, default=None, help="测试总超时（秒），超时后不再发送新请求。全量测试不传以跑完所有请求")
     parser.add_argument("--request-timeout", type=float, default=None, help="单请求 HTTP 超时（秒）。仅轻量化测试传入（如 120），全量测试不传以保持 600s 默认")
     parser.add_argument("--seed", type=int, default=42, help="随机种子，确保两次运行生成完全相同的对话文本")
+    parser.add_argument("--max-output-tokens", type=int, default=None,
+                        help="限制单请求最大生成 token 数（clip trace 中的 output_length）")
     args = parser.parse_args()
 
     runner = PrefetchABRunner(
@@ -551,6 +558,7 @@ async def main():
         prefetch_lead_time=args.prefetch_lead_time,
         seed=args.seed,
         request_timeout=args.request_timeout,
+        max_output_tokens=args.max_output_tokens,
     )
     await runner.run(
         num_multi_turn=args.num_multi_turn,

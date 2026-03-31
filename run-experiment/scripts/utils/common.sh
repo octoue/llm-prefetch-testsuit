@@ -12,6 +12,7 @@ function load_dataset_config() {
     local trace_var="${prefix}_TRACE"
     local full_trace_var="${prefix}_FULL_TRACE"
     local max_input_var="${prefix}_MAX_INPUT"
+    local max_output_var="${prefix}_MAX_OUTPUT"
     local num_conv_var="${prefix}_NUM_CONV"
     local gpu_blocks_var="${prefix}_GPU_BLOCKS"
 
@@ -19,6 +20,7 @@ function load_dataset_config() {
     TRACE="${!trace_var}"
     FULL_TRACE="${!full_trace_var}"
     MAX_INPUT="${!max_input_var}"
+    MAX_OUTPUT="${!max_output_var:-}"
     NUM_CONV="${!num_conv_var}"
     DATASET_GPU_BLOCKS="${!gpu_blocks_var}"
 
