@@ -65,44 +65,49 @@ load_dataset_config "$DATASET"
 # 检查数据集
 generate_dataset_if_needed "$TRACE" "$FULL_TRACE" "$DATASET" || exit 1
 
-# pcie-full / pcie-trace-a-light：全量多轮对话根（与 prefetch_ab_runner._analyze_conversations 一致），从 TRACE 统计 NUM_CONV
+# pcie-full / pcie-trace-a-light / pcie-multiturn：大数据集特殊处理（禁用全局 timeout）
 PCIE_FULL_RUNNER_TIMEOUT_ARGS=(--timeout "$TIMEOUT" --request-timeout "$REQUEST_TIMEOUT")
-if [[ "$DATASET" == "pcie-full" || "$DATASET" == "pcie-trace-a-light" ]]; then
+if [[ "$DATASET" == "pcie-full" || "$DATASET" == "pcie-trace-a-light" || "$DATASET" == "pcie-multiturn" ]]; then
     if [[ ! -f "$TRACE" ]]; then
         echo "❌ $DATASET: trace 不存在: $TRACE"
         exit 1
     fi
-    # 行级文本统计（不解析 JSON）：parent_chat_id=-1 的根且至少有一条子记录引用其 chat_id → 多轮根
-    NUM_CONV=$(
-        awk '
-        index($0, "\"parent_chat_id\": -1") > 0 {
-            if (match($0, /"chat_id": [0-9]+/)) {
-                cid = substr($0, RSTART+11, RLENGTH-11)
-                isroot[cid] = 1
+    # pcie-multiturn 已在 datasets.env 中设置 NUM_CONV，无需自动统计
+    if [[ "$NUM_CONV" -eq 0 ]]; then
+        # 行级文本统计（不解析 JSON）：parent_chat_id=-1 的根且至少有一条子记录引用其 chat_id → 多轮根
+        NUM_CONV=$(
+            awk '
+            index($0, "\"parent_chat_id\": -1") > 0 {
+                if (match($0, /"chat_id": [0-9]+/)) {
+                    cid = substr($0, RSTART+11, RLENGTH-11)
+                    isroot[cid] = 1
+                }
             }
-        }
-        {
-            idx = index($0, "\"parent_chat_id\": ")
-            if (idx == 0) next
-            rest = substr($0, idx + length("\"parent_chat_id\": "))
-            if (length(rest) == 0 || substr(rest, 1, 1) == "-") next
-            if (match(rest, /^[0-9]+/)) {
-                pid = substr(rest, 1, RLENGTH)
-                haschild[pid] = 1
+            {
+                idx = index($0, "\"parent_chat_id\": ")
+                if (idx == 0) next
+                rest = substr($0, idx + length("\"parent_chat_id\": "))
+                if (length(rest) == 0 || substr(rest, 1, 1) == "-") next
+                if (match(rest, /^[0-9]+/)) {
+                    pid = substr(rest, 1, RLENGTH)
+                    haschild[pid] = 1
+                }
             }
-        }
-        END {
-            n = 0
-            for (c in isroot) if (c in haschild) n++
-            print n
-        }
-        ' "$TRACE"
-    )
-    if [[ -z "${NUM_CONV// /}" || ! "$NUM_CONV" =~ ^[0-9]+$ || "$NUM_CONV" -eq 0 ]]; then
-        echo "❌ $DATASET: 无法从 trace 统计多轮对话根数量: $TRACE"
-        exit 1
+            END {
+                n = 0
+                for (c in isroot) if (c in haschild) n++
+                print n
+            }
+            ' "$TRACE"
+        )
+        if [[ -z "${NUM_CONV// /}" || ! "$NUM_CONV" =~ ^[0-9]+$ || "$NUM_CONV" -eq 0 ]]; then
+            echo "❌ $DATASET: 无法从 trace 统计多轮对话根数量: $TRACE"
+            exit 1
+        fi
+        echo "✓ $DATASET: 全量多轮根数量 NUM_CONV=$NUM_CONV（自 trace 统计）"
+    else
+        echo "✓ $DATASET: NUM_CONV=$NUM_CONV（来自 datasets.env）"
     fi
-    echo "✓ $DATASET: 全量多轮根数量 NUM_CONV=$NUM_CONV（自 trace 统计）"
     # 与 heavy 类似的显存/换块压力；总时长由 runner 跑完全部 workload（不传实验级 --timeout）
     REQUEST_TIMEOUT=360
     TIMEOUT=""
@@ -158,7 +163,7 @@ echo "Num conversations: $NUM_CONV"
 echo "QPS: $QPS"
 echo "Prefetch lead time: ${PREFETCH_LEAD_TIME}s"
 echo "GPU blocks: $NUM_GPU_BLOCKS_OVERRIDE"
-if [[ "$DATASET" == "pcie-full" || "$DATASET" == "pcie-trace-a-light" ]]; then
+if [[ "$DATASET" == "pcie-full" || "$DATASET" == "pcie-trace-a-light" || "$DATASET" == "pcie-multiturn" ]]; then
     echo "Runner timeouts: ${PCIE_FULL_RUNNER_TIMEOUT_ARGS[*]} (no global phase timeout)"
 else
     echo "Runner timeouts: TIMEOUT=${TIMEOUT}s REQUEST_TIMEOUT=${REQUEST_TIMEOUT}s"

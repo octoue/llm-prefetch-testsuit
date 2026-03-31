@@ -59,43 +59,48 @@ load_dataset_config "$DATASET"
 # 检查数据集
 generate_dataset_if_needed "$TRACE" "$FULL_TRACE" "$DATASET" || exit 1
 
-# pcie-full / pcie-trace-a-light 特殊处理
+# pcie-full / pcie-trace-a-light / pcie-multiturn 特殊处理
 RUNNER_TIMEOUT_ARGS=(--timeout "$TIMEOUT" --request-timeout "$REQUEST_TIMEOUT")
-if [[ "$DATASET" == "pcie-full" || "$DATASET" == "pcie-trace-a-light" ]]; then
+if [[ "$DATASET" == "pcie-full" || "$DATASET" == "pcie-trace-a-light" || "$DATASET" == "pcie-multiturn" ]]; then
     if [[ ! -f "$TRACE" ]]; then
         echo "❌ $DATASET: trace 不存在: $TRACE"
         exit 1
     fi
-    NUM_CONV=$(
-        awk '
-        index($0, "\"parent_chat_id\": -1") > 0 {
-            if (match($0, /"chat_id": [0-9]+/)) {
-                cid = substr($0, RSTART+11, RLENGTH-11)
-                isroot[cid] = 1
+    # pcie-multiturn 已在 datasets.env 中设置 NUM_CONV，无需自动统计
+    if [[ "$NUM_CONV" -eq 0 ]]; then
+        NUM_CONV=$(
+            awk '
+            index($0, "\"parent_chat_id\": -1") > 0 {
+                if (match($0, /"chat_id": [0-9]+/)) {
+                    cid = substr($0, RSTART+11, RLENGTH-11)
+                    isroot[cid] = 1
+                }
             }
-        }
-        {
-            idx = index($0, "\"parent_chat_id\": ")
-            if (idx == 0) next
-            rest = substr($0, idx + length("\"parent_chat_id\": "))
-            if (length(rest) == 0 || substr(rest, 1, 1) == "-") next
-            if (match(rest, /^[0-9]+/)) {
-                pid = substr(rest, 1, RLENGTH)
-                haschild[pid] = 1
+            {
+                idx = index($0, "\"parent_chat_id\": ")
+                if (idx == 0) next
+                rest = substr($0, idx + length("\"parent_chat_id\": "))
+                if (length(rest) == 0 || substr(rest, 1, 1) == "-") next
+                if (match(rest, /^[0-9]+/)) {
+                    pid = substr(rest, 1, RLENGTH)
+                    haschild[pid] = 1
+                }
             }
-        }
-        END {
-            n = 0
-            for (c in isroot) if (c in haschild) n++
-            print n
-        }
-        ' "$TRACE"
-    )
-    if [[ -z "${NUM_CONV// /}" || ! "$NUM_CONV" =~ ^[0-9]+$ || "$NUM_CONV" -eq 0 ]]; then
-        echo "❌ $DATASET: 无法从 trace 统计多轮对话根数量: $TRACE"
-        exit 1
+            END {
+                n = 0
+                for (c in isroot) if (c in haschild) n++
+                print n
+            }
+            ' "$TRACE"
+        )
+        if [[ -z "${NUM_CONV// /}" || ! "$NUM_CONV" =~ ^[0-9]+$ || "$NUM_CONV" -eq 0 ]]; then
+            echo "❌ $DATASET: 无法从 trace 统计多轮对话根数量: $TRACE"
+            exit 1
+        fi
+        echo "✓ $DATASET: 全量多轮根数量 NUM_CONV=$NUM_CONV（自 trace 统计）"
+    else
+        echo "✓ $DATASET: NUM_CONV=$NUM_CONV（来自 datasets.env）"
     fi
-    echo "✓ $DATASET: 全量多轮根数量 NUM_CONV=$NUM_CONV（自 trace 统计）"
     REQUEST_TIMEOUT=360
     TIMEOUT=""
     RUNNER_TIMEOUT_ARGS=(--request-timeout "$REQUEST_TIMEOUT")
