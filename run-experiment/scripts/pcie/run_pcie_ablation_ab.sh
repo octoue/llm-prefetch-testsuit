@@ -16,7 +16,7 @@
 #   ./run_pcie_ablation_ab.sh pcie-medium --qps 3.0
 #   ./run_pcie_ablation_ab.sh pcie-heavy --qps 1.5 --gpu-blocks 1000
 
-set -e
+set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/../.."
@@ -32,7 +32,6 @@ DATASET="${1:-pcie-medium}"
 shift 2>/dev/null || true
 
 # 解析选项
-NO_TENSORBOARD=0
 NUM_GPU_BLOCKS_OVERRIDE_SET=0
 
 while [[ $# -gt 0 ]]; do
@@ -43,11 +42,9 @@ while [[ $# -gt 0 ]]; do
             PREFETCH_LEAD_TIME="$2"; shift 2 ;;
         --gpu-blocks)
             NUM_GPU_BLOCKS_OVERRIDE="$2"; NUM_GPU_BLOCKS_OVERRIDE_SET=1; shift 2 ;;
-        --no-tensorboard)
-            NO_TENSORBOARD=1; shift ;;
         *)
             echo "❌ Unknown option: $1"
-            echo "Usage: $0 [dataset] [--qps N] [--lead-time N] [--gpu-blocks N] [--no-tensorboard]"
+            echo "Usage: $0 [dataset] [--qps N] [--lead-time N] [--gpu-blocks N]"
             exit 1 ;;
     esac
 done
@@ -163,6 +160,25 @@ echo "  G1: No Scheduler, with Prefetch       (start_vllm_pcie.sh)"
 echo "  G0: No Scheduler, no Prefetch         (start_vllm_pcie.sh, --mode baseline)"
 print_separator
 
+# Helper: 后台捕获 vLLM 日志到实验目录（实时镜像）
+VLLM_TAIL_PID=""
+start_vllm_log_capture() {
+    local dest="$1"
+    stop_vllm_log_capture
+    if [[ -f "$VLLM_LOG" ]]; then
+        tail -f "$VLLM_LOG" > "$dest" 2>/dev/null &
+        VLLM_TAIL_PID=$!
+        echo "✓ Capturing vLLM log → $dest (pid $VLLM_TAIL_PID)"
+    fi
+}
+stop_vllm_log_capture() {
+    if [[ -n "$VLLM_TAIL_PID" ]] && kill -0 "$VLLM_TAIL_PID" 2>/dev/null; then
+        kill "$VLLM_TAIL_PID" 2>/dev/null || true
+        wait "$VLLM_TAIL_PID" 2>/dev/null || true
+        VLLM_TAIL_PID=""
+    fi
+}
+
 # ============================================================
 # Helper: run one experiment phase
 # ============================================================
@@ -180,10 +196,6 @@ run_phase() {
     echo "Starting PCIe profiler..."
     curl -s -X POST "http://localhost:$API_PORT/start_profile" >/dev/null || true
 
-    TB_ARGS=()
-    [[ $ENABLE_TENSORBOARD -eq 1 && $NO_TENSORBOARD -eq 0 ]] && \
-        TB_ARGS=(--tensorboard-dir "$RESULTS_DIR/tensorboard/$SUFFIX")
-
     python3 prefetch_ab_runner.py \
         --trace-file "$TRACE" \
         --mode "$MODE" \
@@ -196,8 +208,7 @@ run_phase() {
         "${RUNNER_TIMEOUT_ARGS[@]}" \
         --prefetch-lead-time "$PREFETCH_LEAD_TIME" \
         --schedule-mode "$SCHEDULE_MODE" \
-        "${TB_ARGS[@]}" \
-        &> "$RESULTS_DIR/prefetch_${SUFFIX}.log"
+        2>&1 | tee "$RESULTS_DIR/prefetch_${SUFFIX}.log"
 
     echo "✓ $GROUP completed"
 
@@ -224,8 +235,6 @@ print(f'Merged {len(events)} events')
             cp "$PCIE_PROFILER_DIR/pcie_events_0.json" "$RESULTS_DIR/pcie_events_${SUFFIX}.json"
         fi
     fi
-    [[ -f "$VLLM_LOG" ]] && cp "$VLLM_LOG" "$RESULTS_DIR/vllm_state_${SUFFIX}.log" 2>/dev/null || true
-
     # 清理 profiler 文件
     rm -f "$PCIE_PROFILER_DIR"/pcie_events_*.json 2>/dev/null || true
 }
@@ -233,6 +242,8 @@ print(f'Merged {len(events)} events')
 # Helper: prompt user to restart vLLM
 prompt_restart() {
     local MSG="$1"
+    local LOG_DEST="$2"
+    stop_vllm_log_capture
     echo ""
     print_separator
     echo "⚠️  Please RESTART vLLM:"
@@ -245,6 +256,7 @@ prompt_restart() {
         echo "❌ Error: vLLM not running."
         exit 1
     fi
+    [[ -n "$LOG_DEST" ]] && start_vllm_log_capture "$LOG_DEST"
 }
 
 # ------------------------------------------------------------------
@@ -258,6 +270,7 @@ if ! check_vllm_running; then
     exit 1
 fi
 
+start_vllm_log_capture "$RESULTS_DIR/vllm_log_g3.log"
 run_phase "G3" "prefetch" "g3_full_sched"
 
 # ------------------------------------------------------------------
@@ -265,7 +278,8 @@ run_phase "G3" "prefetch" "g3_full_sched"
 # ------------------------------------------------------------------
 prompt_restart "1. Stop current vLLM (Ctrl+C)
    2. Start: ./start_vllm_pcie.sh --pcie-scheduler --no-pp-phase-aware
-   3. Press Enter here to continue Phase 2"
+   3. Press Enter here to continue Phase 2" \
+   "$RESULTS_DIR/vllm_log_g2.log"
 
 print_phase "[Phase 2/5] G2: Prefetch + PCIe Scheduler, NO PP Phase-Aware"
 
@@ -275,8 +289,9 @@ run_phase "G2" "prefetch" "g2_sched_no_phase"
 # Phase 3: G1 — No Scheduler, with Prefetch
 # ------------------------------------------------------------------
 prompt_restart "1. Stop current vLLM (Ctrl+C)
-   2. Start: ./start_vllm_pcie.sh   (no --pcie-scheduler)
-   3. Press Enter here to continue Phase 3"
+   2. Start: ./start_vllm_pcie.sh
+   3. Press Enter here to continue Phase 3" \
+   "$RESULTS_DIR/vllm_log_g1_g0.log"
 
 print_phase "[Phase 3/5] G1: Prefetch, no PCIe Scheduler (baseline prefetch)"
 
@@ -293,6 +308,8 @@ curl -s -X POST "http://localhost:$API_PORT/reset_prefix_cache?reset_external=tr
 sleep 5
 
 run_phase "G0" "baseline" "g0_no_prefetch"
+
+stop_vllm_log_capture
 
 # ------------------------------------------------------------------
 # Phase 5: Generate Report
@@ -403,5 +420,5 @@ echo "Results:"
 echo "  Run directory:    $RESULTS_DIR"
 echo "  Ablation report:  $ABLATION_MD"
 echo "  Master TSV:       $ABLATION_TABLE_TSV"
-echo "  Per-group files:  prefetch_g{0,1,2,3}_*.{jsonl,log}, pcie_events_g{0,1,2,3}_*.json"
+echo "  Per-group files:  prefetch_g{0,1,2,3}_*.{jsonl,log}, pcie_events_g{0,1,2,3}_*.json, vllm_log_*.log"
 print_separator

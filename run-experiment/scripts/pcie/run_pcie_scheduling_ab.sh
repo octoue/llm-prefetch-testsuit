@@ -22,7 +22,7 @@
 # 注意: 需在 Phase 1 前用 start_vllm_pcie.sh --pcie-scheduler 启动 vLLM；
 #       Phase 1 结束后需重启 vLLM（不用 --pcie-scheduler）再继续 Phase 2。
 
-set -e
+set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/../.."
@@ -38,7 +38,6 @@ DATASET="${1:-pcie-medium}"
 shift 2>/dev/null || true
 
 # 解析选项
-NO_TENSORBOARD=0
 NUM_GPU_BLOCKS_OVERRIDE_SET=0
 
 while [[ $# -gt 0 ]]; do
@@ -49,11 +48,9 @@ while [[ $# -gt 0 ]]; do
             PREFETCH_LEAD_TIME="$2"; shift 2 ;;
         --gpu-blocks)
             NUM_GPU_BLOCKS_OVERRIDE="$2"; NUM_GPU_BLOCKS_OVERRIDE_SET=1; shift 2 ;;
-        --no-tensorboard)
-            NO_TENSORBOARD=1; shift ;;
         *)
             echo "❌ Unknown option: $1"
-            echo "Usage: $0 [dataset] [--qps N] [--lead-time N] [--gpu-blocks N] [--no-tensorboard]"
+            echo "Usage: $0 [dataset] [--qps N] [--lead-time N] [--gpu-blocks N]"
             exit 1 ;;
     esac
 done
@@ -172,6 +169,25 @@ echo "Run directory: $RESULTS_DIR"
 echo "Master TSV (all runs): $MASTER_TABLE_TSV"
 print_separator
 
+# Helper: 后台捕获 vLLM 日志到实验目录（实时镜像）
+VLLM_TAIL_PID=""
+start_vllm_log_capture() {
+    local dest="$1"
+    stop_vllm_log_capture
+    if [[ -f "$VLLM_LOG" ]]; then
+        tail -f "$VLLM_LOG" > "$dest" 2>/dev/null &
+        VLLM_TAIL_PID=$!
+        echo "✓ Capturing vLLM log → $dest (pid $VLLM_TAIL_PID)"
+    fi
+}
+stop_vllm_log_capture() {
+    if [[ -n "$VLLM_TAIL_PID" ]] && kill -0 "$VLLM_TAIL_PID" 2>/dev/null; then
+        kill "$VLLM_TAIL_PID" 2>/dev/null || true
+        wait "$VLLM_TAIL_PID" 2>/dev/null || true
+        VLLM_TAIL_PID=""
+    fi
+}
+
 # ------------------------------------------------------------------
 # Phase 1: Prefetch + PCIe Scheduling (VLLM_PCIE_SCHEDULER=1)
 # ------------------------------------------------------------------
@@ -183,6 +199,8 @@ if ! check_vllm_running; then
     exit 1
 fi
 
+start_vllm_log_capture "$RESULTS_DIR/vllm_log_pcie_sched.log"
+
 echo "Resetting prefix cache..."
 curl -s -X POST "http://localhost:$API_PORT/reset_prefix_cache?reset_external=true" >/dev/null || true
 sleep 5
@@ -192,10 +210,6 @@ echo "Clearing stale PCIe event files in $PCIE_PROFILER_DIR..."
 rm -f "$PCIE_PROFILER_DIR"/pcie_events_*.json 2>/dev/null || true
 echo "Starting PCIe profiler..."
 curl -s -X POST "http://localhost:$API_PORT/start_profile" >/dev/null || true
-
-TB_ARGS=()
-[[ $ENABLE_TENSORBOARD -eq 1 && $NO_TENSORBOARD -eq 0 ]] && \
-    TB_ARGS=(--tensorboard-dir "$RESULTS_DIR/tensorboard/pcie_sched")
 
 python3 prefetch_ab_runner.py \
     --trace-file "$TRACE" \
@@ -209,8 +223,7 @@ python3 prefetch_ab_runner.py \
     "${PCIE_FULL_RUNNER_TIMEOUT_ARGS[@]}" \
     --prefetch-lead-time "$PREFETCH_LEAD_TIME" \
     --schedule-mode "$SCHEDULE_MODE" \
-    "${TB_ARGS[@]}" \
-    &> "$RESULTS_DIR/prefetch_pcie_sched.log"
+    2>&1 | tee "$RESULTS_DIR/prefetch_pcie_sched.log"
 
 echo "✓ Phase 1 completed"
 
@@ -237,8 +250,6 @@ print(f'Merged {len(events)} events')
         cp "$PCIE_PROFILER_DIR/pcie_events_0.json" "$RESULTS_DIR/pcie_events_pcie_sched.json"
     fi
 fi
-[[ -f "$VLLM_LOG" ]] && cp "$VLLM_LOG" "$RESULTS_DIR/vllm_state_pcie_sched.log" 2>/dev/null || true
-
 # Phase 2 会重新写入 profiler；若不删除，baseline 易重复采集 Phase 1 的 pcie_events_*.json
 echo "Removing profiler PCIe event files before Phase 2..."
 rm -f "$PCIE_PROFILER_DIR"/pcie_events_*.json 2>/dev/null || true
@@ -248,9 +259,10 @@ rm -f "$PCIE_PROFILER_DIR"/pcie_events_*.json 2>/dev/null || true
 # ------------------------------------------------------------------
 echo ""
 print_separator
+stop_vllm_log_capture
 echo "⚠️  Please RESTART vLLM WITHOUT PCIe scheduler:"
 echo "   1. Stop current vLLM (Ctrl+C in the terminal running vLLM)"
-echo "   2. Start: ./start_vllm_pcie.sh   (no --pcie-scheduler)"
+echo "   2. Start: ./start_vllm_pcie.sh"
 echo "   3. Press Enter here to continue Phase 2"
 print_separator
 read -r
@@ -263,6 +275,8 @@ if ! check_vllm_running; then
     exit 1
 fi
 
+start_vllm_log_capture "$RESULTS_DIR/vllm_log_baseline.log"
+
 print_phase "[Phase 2/3] Prefetch without PCIe Scheduling (baseline)"
 
 echo "Resetting prefix cache..."
@@ -271,10 +285,6 @@ sleep 5
 
 echo "Starting PCIe profiler..."
 curl -s -X POST "http://localhost:$API_PORT/start_profile" >/dev/null || true
-
-TB_ARGS=()
-[[ $ENABLE_TENSORBOARD -eq 1 && $NO_TENSORBOARD -eq 0 ]] && \
-    TB_ARGS=(--tensorboard-dir "$RESULTS_DIR/tensorboard/baseline")
 
 python3 prefetch_ab_runner.py \
     --trace-file "$TRACE" \
@@ -288,8 +298,7 @@ python3 prefetch_ab_runner.py \
     "${PCIE_FULL_RUNNER_TIMEOUT_ARGS[@]}" \
     --prefetch-lead-time "$PREFETCH_LEAD_TIME" \
     --schedule-mode "$SCHEDULE_MODE" \
-    "${TB_ARGS[@]}" \
-    &> "$RESULTS_DIR/prefetch_baseline.log"
+    2>&1 | tee "$RESULTS_DIR/prefetch_baseline.log"
 
 echo "✓ Phase 2 completed"
 
@@ -315,7 +324,7 @@ with open('$RESULTS_DIR/pcie_events_baseline.json', 'w') as fp:
         cp "$PCIE_PROFILER_DIR/pcie_events_0.json" "$RESULTS_DIR/pcie_events_baseline.json"
     fi
 fi
-[[ -f "$VLLM_LOG" ]] && cp "$VLLM_LOG" "$RESULTS_DIR/vllm_state_baseline.log" 2>/dev/null || true
+stop_vllm_log_capture
 
 # ------------------------------------------------------------------
 # Phase 3: 生成合并 Markdown 报告 + 追加 TSV 汇总行（不写 results 下的 config_snapshot.env）
@@ -331,7 +340,7 @@ cleanup_phase3_tmp() {
 trap cleanup_phase3_tmp EXIT
 
 # 临时 key=value 配置（仅用于报告生成，不落盘到实验目录）
-# grep 在无匹配时返回 1，需吞掉以免 set -e 中断
+# grep 在无匹配时返回 1，需吞掉以免 set -eo pipefail 中断
 DATASET="$DATASET" QPS="$QPS" PREFETCH_LEAD_TIME="$PREFETCH_LEAD_TIME" \
     NUM_GPU_BLOCKS_OVERRIDE="$NUM_GPU_BLOCKS_OVERRIDE" TRACE="$TRACE" FULL_TRACE="$FULL_TRACE" \
     NUM_CONV="$NUM_CONV" MODEL_PATH="$MODEL_PATH" \
@@ -404,5 +413,5 @@ echo "Results:"
 echo "  Run directory: $RESULTS_DIR"
 echo "  Merged report: $MERGED_MD"
 echo "  Master TSV:    $MASTER_TABLE_TSV"
-echo "  Logs / jsonl:  prefetch_*.log, prefetch_*.jsonl, pcie_events_*.json, vllm_state_*.log"
+echo "  Logs / jsonl:  prefetch_*.log, prefetch_*.jsonl, pcie_events_*.json, vllm_log_*.log"
 print_separator

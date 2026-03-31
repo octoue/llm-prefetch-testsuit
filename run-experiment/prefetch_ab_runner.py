@@ -22,17 +22,6 @@ from collections import defaultdict
 from openai import AsyncOpenAI
 import tiktoken
 
-# TensorBoard 可选依赖
-try:
-    from torch.utils.tensorboard import SummaryWriter
-    HAS_TENSORBOARD = True
-except ImportError:
-    try:
-        from tensorboardX import SummaryWriter
-        HAS_TENSORBOARD = True
-    except ImportError:
-        HAS_TENSORBOARD = False
-
 # 单词池常量（与 test.py 一致）
 WORD_POOL_SIZE = 10000
 COMMON_WORDS_FOR_POOL = [
@@ -60,7 +49,6 @@ class PrefetchABRunner:
         prefetch_lead_time: float = 0.2,
         seed: int = 42,
         request_timeout: Optional[float] = None,
-        tensorboard_dir: Optional[str] = None,
     ):
         self.trace_file = trace_file
         self.api_base = api_base
@@ -69,7 +57,6 @@ class PrefetchABRunner:
         self.prefetch_lead_time = prefetch_lead_time  # prefetch 提前量（秒），在 scheduled_time - lead_time 发送
         self.seed = seed
         self.request_timeout = request_timeout  # 仅轻量化测试使用，None 时保持 OpenAI 默认 600s
-        self.tensorboard_dir = tensorboard_dir
 
         # 在 seed 设置后生成单词池，确保两次运行生成完全相同的文本
         random.seed(seed)
@@ -98,14 +85,7 @@ class PrefetchABRunner:
         self.timeout: Optional[float] = None
         self.test_start_time: Optional[float] = None
 
-        # TensorBoard
-        self._tb_writer: Optional[Any] = None
-        if tensorboard_dir and HAS_TENSORBOARD:
-            self._tb_writer = SummaryWriter(log_dir=tensorboard_dir)
-        elif tensorboard_dir and not HAS_TENSORBOARD:
-            print("Warning: tensorboard 未安装，跳过 TensorBoard 记录。可安装: pip install tensorboard 或 tensorboardX")
-
-        # 进度与统计（用于后台打印和 TensorBoard）
+        # 进度与统计（用于后台打印）
         self._stats_lock = asyncio.Lock()
         self._completed_count = 0
         self._success_count = 0
@@ -441,10 +421,9 @@ class PrefetchABRunner:
                 output_file.write(json.dumps(log_row, ensure_ascii=False) + "\n")
                 output_file.flush()
 
-            # 更新进度统计并写入 TensorBoard
+            # 更新进度统计
             async with self._stats_lock:
                 self._completed_count += 1
-                step = self._completed_count
                 if result["success"]:
                     self._success_count += 1
                     self._ttft_list.append(result["ttft"] * 1000)
@@ -453,23 +432,6 @@ class PrefetchABRunner:
                     self._cached_count += 1
                 if prefetch_cached_tokens is not None and prefetch_cached_tokens > 0:
                     self._prefetch_cached_list.append(prefetch_cached_tokens)
-
-                if self._tb_writer:
-                    self._tb_writer.add_scalar("Progress/completed", step, step)
-                    self._tb_writer.add_scalar("Progress/elapsed_sec", time.time() - test_start_time, step)
-                    self._tb_writer.add_scalar("Progress/success_rate", self._success_count / step, step)
-                    if result["success"]:
-                        self._tb_writer.add_scalar("TTFT/ttft_ms", result["ttft"] * 1000, step)
-                        self._tb_writer.add_scalar("TPOT/tpot_ms", result["tpot"] * 1000, step)
-                        if self._ttft_list:
-                            self._tb_writer.add_scalar("TTFT/running_mean", statistics.mean(self._ttft_list), step)
-                        if self._tpot_list:
-                            self._tb_writer.add_scalar("TPOT/running_mean", statistics.mean(self._tpot_list), step)
-                    if result.get("cached_tokens") is not None:
-                        self._tb_writer.add_scalar("Cache/cached_tokens", result["cached_tokens"] or 0, step)
-                    self._tb_writer.add_scalar("Cache/cache_hit_rate", self._cached_count / step, step)
-                    if prefetch_cached_tokens is not None:
-                        self._tb_writer.add_scalar("Prefetch/prefetch_cached_tokens", prefetch_cached_tokens, step)
 
             status = "✓" if result["success"] else "✗"
             cached_str = f", cached={result['cached_tokens']}" if result["cached_tokens"] is not None else ""
@@ -560,8 +522,6 @@ class PrefetchABRunner:
             print(f"[TTFT] mean={statistics.mean(self._ttft_list):.0f}ms, p50={statistics.median(self._ttft_list):.0f}ms")
         if self._tpot_list:
             print(f"[TPOT] mean={statistics.mean(self._tpot_list):.1f}ms")
-        if self._tb_writer:
-            self._tb_writer.close()
         print(f"\n结果已写入: {output}")
 
 
@@ -580,7 +540,6 @@ async def main():
                         help="uniform=均匀排程; scaled-timestamp=按原始时间戳缩放保留 burst")
     parser.add_argument("--timeout", type=float, default=None, help="测试总超时（秒），超时后不再发送新请求。全量测试不传以跑完所有请求")
     parser.add_argument("--request-timeout", type=float, default=None, help="单请求 HTTP 超时（秒）。仅轻量化测试传入（如 120），全量测试不传以保持 600s 默认")
-    parser.add_argument("--tensorboard-dir", type=str, default=None, help="TensorBoard 日志目录，传入时启用实时监控")
     parser.add_argument("--seed", type=int, default=42, help="随机种子，确保两次运行生成完全相同的对话文本")
     args = parser.parse_args()
 
@@ -592,7 +551,6 @@ async def main():
         prefetch_lead_time=args.prefetch_lead_time,
         seed=args.seed,
         request_timeout=args.request_timeout,
-        tensorboard_dir=args.tensorboard_dir,
     )
     await runner.run(
         num_multi_turn=args.num_multi_turn,

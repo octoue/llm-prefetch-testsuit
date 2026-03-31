@@ -13,7 +13,7 @@
 #   ./auto_run_pcie_ablation_ab.sh pcie-medium --qps 3.0
 #   ./auto_run_pcie_ablation_ab.sh pcie-heavy --qps 1.5 --gpu-blocks 1000
 
-set -e
+set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_EXP_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -124,7 +124,6 @@ print(f'Merged {len(events)} events')
         echo "⚠️  No pcie_events_*.json found for $suffix"
     fi
 
-    [[ -f "$VLLM_LOG" ]] && cp "$VLLM_LOG" "$RESULTS_DIR/vllm_state_${suffix}.log" 2>/dev/null || true
     rm -f "$PCIE_PROFILER_DIR"/pcie_events_*.json 2>/dev/null || true
 }
 
@@ -141,7 +140,6 @@ DATASET="${1:-pcie-medium}"
 shift 2>/dev/null || true
 
 # 解析选项
-NO_TENSORBOARD=0
 NUM_GPU_BLOCKS_OVERRIDE_SET=0
 
 while [[ $# -gt 0 ]]; do
@@ -149,10 +147,9 @@ while [[ $# -gt 0 ]]; do
         --qps)             QPS="$2"; shift 2 ;;
         --lead-time)       PREFETCH_LEAD_TIME="$2"; shift 2 ;;
         --gpu-blocks)      NUM_GPU_BLOCKS_OVERRIDE="$2"; NUM_GPU_BLOCKS_OVERRIDE_SET=1; shift 2 ;;
-        --no-tensorboard)  NO_TENSORBOARD=1; shift ;;
         *)
             echo "❌ Unknown option: $1"
-            echo "Usage: $0 [dataset] [--qps N] [--lead-time N] [--gpu-blocks N] [--no-tensorboard]"
+            echo "Usage: $0 [dataset] [--qps N] [--lead-time N] [--gpu-blocks N]"
             exit 1 ;;
     esac
 done
@@ -282,10 +279,6 @@ run_phase() {
     echo "Starting PCIe profiler..."
     curl -s -X POST "http://localhost:$API_PORT/start_profile" >/dev/null || true
 
-    TB_ARGS=()
-    [[ $ENABLE_TENSORBOARD -eq 1 && $NO_TENSORBOARD -eq 0 ]] && \
-        TB_ARGS=(--tensorboard-dir "$RESULTS_DIR/tensorboard/$SUFFIX")
-
     python3 prefetch_ab_runner.py \
         --trace-file "$TRACE" \
         --mode "$MODE" \
@@ -298,8 +291,7 @@ run_phase() {
         "${RUNNER_TIMEOUT_ARGS[@]}" \
         --prefetch-lead-time "$PREFETCH_LEAD_TIME" \
         --schedule-mode "$SCHEDULE_MODE" \
-        "${TB_ARGS[@]}" \
-        &> "$RESULTS_DIR/prefetch_${SUFFIX}.log"
+        2>&1 | tee "$RESULTS_DIR/prefetch_${SUFFIX}.log"
 
     echo "✓ $GROUP completed"
 
@@ -314,7 +306,7 @@ run_phase() {
 # Phase 1: G3 — Full scheduling (PCIe Scheduler + PP Phase-Aware)
 # ============================================================
 
-start_vllm g3 --pcie-scheduler || exit 1
+start_vllm g3 --pcie-scheduler --log-file "$RESULTS_DIR/vllm_log_g3.log" || exit 1
 
 print_phase "[Phase 1/5] G3: Prefetch + PCIe Scheduler + PP Phase-Aware"
 run_phase "G3" "prefetch" "g3_full_sched"
@@ -325,7 +317,7 @@ run_phase "G3" "prefetch" "g3_full_sched"
 
 print_phase "Restarting vLLM for Phase 2 (--pcie-scheduler --no-pp-phase-aware)..."
 stop_vllm
-start_vllm g2 --pcie-scheduler --no-pp-phase-aware || exit 1
+start_vllm g2 --pcie-scheduler --no-pp-phase-aware --log-file "$RESULTS_DIR/vllm_log_g2.log" || exit 1
 
 # ============================================================
 # Phase 2: G2 — Scheduler ON, Phase-Aware OFF
@@ -340,7 +332,7 @@ run_phase "G2" "prefetch" "g2_sched_no_phase"
 
 print_phase "Restarting vLLM for Phase 3 (no scheduler)..."
 stop_vllm
-start_vllm g1_g0 || exit 1
+start_vllm g1_g0 --log-file "$RESULTS_DIR/vllm_log_g1_g0.log" || exit 1
 
 # ============================================================
 # Phase 3: G1 — No Scheduler, with Prefetch
@@ -473,5 +465,5 @@ echo "  Experiment ID:    $EXP_ID"
 echo "  Run directory:    $RESULTS_DIR"
 echo "  Ablation report:  $ABLATION_MD"
 echo "  Master TSV:       $ABLATION_TABLE_TSV"
-echo "  Per-group files:  prefetch_g{0,1,2,3}_*.{jsonl,log}, pcie_events_g{0,1,2,3}_*.json"
+echo "  Per-group files:  prefetch_g{0,1,2,3}_*.{jsonl,log}, pcie_events_g{0,1,2,3}_*.json, vllm_log_*.log"
 print_separator

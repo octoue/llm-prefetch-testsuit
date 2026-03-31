@@ -12,7 +12,7 @@
 #   ./auto_run_pcie_scheduling_ab.sh pcie-trace-a-light
 #   ./auto_run_pcie_scheduling_ab.sh pcie-heavy --qps 3.0
 
-set -e
+set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_EXP_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -123,7 +123,6 @@ print(f'Merged {len(events)} events')
         echo "⚠️  No pcie_events_*.json found for $suffix"
     fi
 
-    [[ -f "$VLLM_LOG" ]] && cp "$VLLM_LOG" "$RESULTS_DIR/vllm_state_${suffix}.log" 2>/dev/null || true
     rm -f "$PCIE_PROFILER_DIR"/pcie_events_*.json 2>/dev/null || true
 }
 
@@ -140,7 +139,6 @@ DATASET="${1:-pcie-medium}"
 shift 2>/dev/null || true
 
 # 解析选项
-NO_TENSORBOARD=0
 NUM_GPU_BLOCKS_OVERRIDE_SET=0
 
 while [[ $# -gt 0 ]]; do
@@ -148,10 +146,9 @@ while [[ $# -gt 0 ]]; do
         --qps)             QPS="$2"; shift 2 ;;
         --lead-time)       PREFETCH_LEAD_TIME="$2"; shift 2 ;;
         --gpu-blocks)      NUM_GPU_BLOCKS_OVERRIDE="$2"; NUM_GPU_BLOCKS_OVERRIDE_SET=1; shift 2 ;;
-        --no-tensorboard)  NO_TENSORBOARD=1; shift ;;
         *)
             echo "❌ Unknown option: $1"
-            echo "Usage: $0 [dataset] [--qps N] [--lead-time N] [--gpu-blocks N] [--no-tensorboard]"
+            echo "Usage: $0 [dataset] [--qps N] [--lead-time N] [--gpu-blocks N]"
             exit 1 ;;
     esac
 done
@@ -267,7 +264,7 @@ print_separator
 # Phase 1: Prefetch + PCIe Scheduling
 # ============================================================
 
-start_vllm pcie_sched --pcie-scheduler || exit 1
+start_vllm pcie_sched --pcie-scheduler --log-file "$RESULTS_DIR/vllm_log_pcie_sched.log" || exit 1
 
 print_phase "[Phase 1/3] Prefetch with PCIe Scheduling (VLLM_PCIE_SCHEDULER=1)"
 
@@ -279,10 +276,6 @@ echo "Clearing stale PCIe event files in $PCIE_PROFILER_DIR..."
 rm -f "$PCIE_PROFILER_DIR"/pcie_events_*.json 2>/dev/null || true
 echo "Starting PCIe profiler..."
 curl -s -X POST "http://localhost:$API_PORT/start_profile" >/dev/null || true
-
-TB_ARGS=()
-[[ $ENABLE_TENSORBOARD -eq 1 && $NO_TENSORBOARD -eq 0 ]] && \
-    TB_ARGS=(--tensorboard-dir "$RESULTS_DIR/tensorboard/pcie_sched")
 
 python3 prefetch_ab_runner.py \
     --trace-file "$TRACE" \
@@ -296,8 +289,7 @@ python3 prefetch_ab_runner.py \
     "${PCIE_FULL_RUNNER_TIMEOUT_ARGS[@]}" \
     --prefetch-lead-time "$PREFETCH_LEAD_TIME" \
     --schedule-mode "$SCHEDULE_MODE" \
-    "${TB_ARGS[@]}" \
-    &> "$RESULTS_DIR/prefetch_pcie_sched.log"
+    2>&1 | tee "$RESULTS_DIR/prefetch_pcie_sched.log"
 
 echo "✓ Phase 1 completed"
 
@@ -313,7 +305,7 @@ collect_pcie_events "pcie_sched"
 
 print_phase "Restarting vLLM for Phase 2 (without PCIe scheduler)..."
 stop_vllm
-start_vllm baseline || exit 1
+start_vllm baseline --log-file "$RESULTS_DIR/vllm_log_baseline.log" || exit 1
 
 # ============================================================
 # Phase 2: Prefetch without PCIe Scheduling (baseline)
@@ -328,10 +320,6 @@ sleep 5
 echo "Starting PCIe profiler..."
 curl -s -X POST "http://localhost:$API_PORT/start_profile" >/dev/null || true
 
-TB_ARGS=()
-[[ $ENABLE_TENSORBOARD -eq 1 && $NO_TENSORBOARD -eq 0 ]] && \
-    TB_ARGS=(--tensorboard-dir "$RESULTS_DIR/tensorboard/baseline")
-
 python3 prefetch_ab_runner.py \
     --trace-file "$TRACE" \
     --mode prefetch \
@@ -344,8 +332,7 @@ python3 prefetch_ab_runner.py \
     "${PCIE_FULL_RUNNER_TIMEOUT_ARGS[@]}" \
     --prefetch-lead-time "$PREFETCH_LEAD_TIME" \
     --schedule-mode "$SCHEDULE_MODE" \
-    "${TB_ARGS[@]}" \
-    &> "$RESULTS_DIR/prefetch_baseline.log"
+    2>&1 | tee "$RESULTS_DIR/prefetch_baseline.log"
 
 echo "✓ Phase 2 completed"
 
@@ -443,5 +430,5 @@ echo "  Experiment ID: $EXP_ID"
 echo "  Directory:     $RESULTS_DIR"
 echo "  Merged report: $MERGED_MD"
 echo "  Master TSV:    $MASTER_TABLE_TSV"
-echo "  Logs / jsonl:  prefetch_*.log, prefetch_*.jsonl, pcie_events_*.json, vllm_state_*.log"
+echo "  Logs / jsonl:  prefetch_*.log, prefetch_*.jsonl, pcie_events_*.json, vllm_log_*.log"
 print_separator

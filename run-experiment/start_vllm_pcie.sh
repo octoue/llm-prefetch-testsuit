@@ -14,6 +14,7 @@ cd "$SCRIPT_DIR"
 # 解析可选参数
 PCIE_SCHEDULER=0
 NO_PP_PHASE_AWARE=0  # 消融实验：禁用 PP Phase 感知，仅验证双队列+Evict-first
+LOG_FILE_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --pcie-scheduler)
@@ -22,6 +23,9 @@ while [[ $# -gt 0 ]]; do
         --no-pp-phase-aware)
             NO_PP_PHASE_AWARE=1
             shift ;;
+        --log-file)
+            LOG_FILE_OVERRIDE="$2"
+            shift 2 ;;
         medium)
             shift ;;
         *)
@@ -43,6 +47,13 @@ set +a
 [[ "$VLLM_LOG" != /* ]] && VLLM_LOG="$SCRIPT_DIR/$VLLM_LOG"
 [[ "$VLLM_SRC" != /* ]] && VLLM_SRC="$SCRIPT_DIR/$VLLM_SRC"
 [[ "$PCIE_PROFILER_DIR" != /* ]] && PCIE_PROFILER_DIR="$SCRIPT_DIR/$PCIE_PROFILER_DIR"
+
+# --log-file 覆盖默认 VLLM_LOG，用于将日志实时写入指定路径（如实验目录）
+if [[ -n "$LOG_FILE_OVERRIDE" ]]; then
+    [[ "$LOG_FILE_OVERRIDE" != /* ]] && LOG_FILE_OVERRIDE="$(pwd)/$LOG_FILE_OVERRIDE"
+    mkdir -p "$(dirname "$LOG_FILE_OVERRIDE")"
+    VLLM_LOG="$LOG_FILE_OVERRIDE"
+fi
 
 mkdir -p "$PCIE_PROFILER_DIR"
 
