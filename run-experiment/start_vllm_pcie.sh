@@ -1,9 +1,11 @@
 #!/bin/bash
 # vLLM 启动脚本（PCIe Profiling 版）
 # 在 start_vllm.sh 基础上增加：禁用 NVLink、轻量 PCIe Profiler（仅 PCIeTracer，无 torch 开销）
-# 用法: ./start_vllm_pcie.sh [medium|--pcie-scheduler]
-#   medium: 仅提示，与默认共用 NUM_GPU_BLOCKS_OVERRIDE
-#   --pcie-scheduler: 启用 PCIe 调度算法 (VLLM_PCIE_SCHEDULER=1)，用于 A/B 实验 Phase 1
+# 用法: ./start_vllm_pcie.sh [--pcie-scheduler] [--gpu-blocks N] [--no-pp-phase-aware] [--log-file PATH]
+#   --pcie-scheduler:    启用 PCIe 调度算法 (VLLM_PCIE_SCHEDULER=1)，用于 A/B 实验 Phase 1
+#   --gpu-blocks N:      覆盖 system.env 中的 NUM_GPU_BLOCKS_OVERRIDE（不同数据集可能需要不同值）
+#   --no-pp-phase-aware: 消融实验：禁用 PP Phase 感知
+#   --log-file PATH:     日志输出到指定路径
 # 配合 run_pcie_scheduling_ab.sh 使用
 
 set -e
@@ -15,6 +17,7 @@ cd "$SCRIPT_DIR"
 PCIE_SCHEDULER=0
 NO_PP_PHASE_AWARE=0  # 消融实验：禁用 PP Phase 感知，仅验证双队列+Evict-first
 LOG_FILE_OVERRIDE=""
+GPU_BLOCKS_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --pcie-scheduler)
@@ -25,6 +28,9 @@ while [[ $# -gt 0 ]]; do
             shift ;;
         --log-file)
             LOG_FILE_OVERRIDE="$2"
+            shift 2 ;;
+        --gpu-blocks)
+            GPU_BLOCKS_OVERRIDE="$2"
             shift 2 ;;
         medium)
             shift ;;
@@ -41,6 +47,11 @@ set -a
 source "$SCRIPT_DIR/config/system.env"
 source "$SCRIPT_DIR/config/experiments.env"
 set +a
+
+# --gpu-blocks 覆盖 system.env 中的 NUM_GPU_BLOCKS_OVERRIDE
+if [[ -n "$GPU_BLOCKS_OVERRIDE" ]]; then
+    NUM_GPU_BLOCKS_OVERRIDE="$GPU_BLOCKS_OVERRIDE"
+fi
 
 [[ "$PCIE_SCHEDULER" -eq 1 ]] && export VLLM_PCIE_SCHEDULER=1 && echo "PCIe Scheduler: enabled (VLLM_PCIE_SCHEDULER=1)"
 
