@@ -142,8 +142,9 @@ fi
 
 export VLLM_LOGGING_LEVEL="${VLLM_LOG_LEVEL:-INFO}"
 
-# Terminal filter: full log goes to $VLLM_LOG, terminal hides per-request noise
-# Filtered patterns (high-frequency per-request logs):
+# Log noise filter: per-request high-frequency logs that dominate file size
+# These are filtered from BOTH the log file and terminal output.
+# To capture full unfiltered output, set VLLM_FULL_LOG=1 before running.
 #   - "offload MISS" / "offload HIT"        (offloading_connector.py, every request)
 #   - "scheduling CPU->GPU load"             (offloading_connector.py, every load)
 #   - "Prefetch .*: CPU hit/GPU hit/NO HIT"  (scheduler.py, every prefetch check)
@@ -151,10 +152,17 @@ export VLLM_LOGGING_LEVEL="${VLLM_LOG_LEVEL:-INFO}"
 #   - "Block allocation failed"              (scheduler.py, when blocks are tight)
 #   - "Delaying request"                     (offloading_connector.py, blocks loading)
 #   - "offloading .* blocks"                 (offloading_connector.py, every offload)
-# To see full output: tail -f $VLLM_LOG
 NOISE_FILTER='offload (MISS|HIT)|scheduling CPU->GPU load|Prefetch .+: (CPU hit|GPU hit|NO HIT|CPU load complete|deferred)|Block allocation failed|Delaying request|offloading [0-9]+ blocks'
 
-VLLM_SERVER_DEV_MODE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=$FREE_GPUS \
-  vllm serve "${CMD_ARGS[@]}" 2>&1 \
-  | tee "$VLLM_LOG" \
-  | grep --line-buffered -Ev "$NOISE_FILTER"
+if [[ "${VLLM_FULL_LOG:-0}" == "1" ]]; then
+  echo "⚠️  VLLM_FULL_LOG=1: writing unfiltered log to $VLLM_LOG (may be very large)"
+  VLLM_SERVER_DEV_MODE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=$FREE_GPUS \
+    vllm serve "${CMD_ARGS[@]}" 2>&1 \
+    | tee "$VLLM_LOG" \
+    | grep --line-buffered -Ev "$NOISE_FILTER"
+else
+  VLLM_SERVER_DEV_MODE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=$FREE_GPUS \
+    vllm serve "${CMD_ARGS[@]}" 2>&1 \
+    | grep --line-buffered -Ev "$NOISE_FILTER" \
+    | tee "$VLLM_LOG"
+fi
