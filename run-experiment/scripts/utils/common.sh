@@ -111,6 +111,36 @@ function generate_dataset_if_needed() {
     fi
 }
 
+function wait_for_idle_gpus() {
+    # 等待至少 N 张 GPU 空闲（显存 < 阈值 且 利用率 = 0%）后返回
+    # 用法: wait_for_idle_gpus [MIN_IDLE_GPUS] [MEM_THRESHOLD_MIB] [POLL_INTERVAL_SEC]
+    local min_idle="${1:-2}"
+    local mem_thresh="${2:-100}"       # MiB，低于此视为空闲
+    local poll_interval="${3:-60}"     # 秒
+
+    while true; do
+        # nvidia-smi 查询每张卡的已用显存(MiB)和 GPU 利用率(%)
+        local idle=0
+        while IFS=', ' read -r mem_used gpu_util; do
+            # 去除单位和空格
+            mem_used="${mem_used%% *}"
+            gpu_util="${gpu_util%% *}"
+            if [[ "$mem_used" -lt "$mem_thresh" && "$gpu_util" -eq 0 ]] 2>/dev/null; then
+                idle=$((idle + 1))
+            fi
+        done < <(nvidia-smi --query-gpu=memory.used,utilization.gpu \
+                            --format=csv,noheader,nounits 2>/dev/null)
+
+        if [[ "$idle" -ge "$min_idle" ]]; then
+            echo "✓ GPU 空闲检查通过: ${idle} 张 GPU 空闲 (需要 >=${min_idle})"
+            return 0
+        fi
+
+        echo "[$(date '+%H:%M:%S')] GPU 忙碌: 仅 ${idle}/${min_idle} 张空闲，${poll_interval}s 后重试..."
+        sleep "$poll_interval"
+    done
+}
+
 function print_separator() {
     echo "============================================"
 }

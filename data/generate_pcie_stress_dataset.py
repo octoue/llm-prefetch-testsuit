@@ -306,10 +306,10 @@ def main():
                 'gpu_blocks': 1200,
             },
             'heavy': {
-                'num_conversations': 16,
-                'turns_range': (6, 10),
+                'num_conversations': 40,
+                'turns_range': (5, 12),
                 'max_input': 2200,
-                'max_total_tokens': 20000,
+                'max_total_tokens': 25000,
                 'gpu_blocks': 1000,
             },
         }

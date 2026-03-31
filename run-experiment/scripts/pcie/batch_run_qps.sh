@@ -24,6 +24,9 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUN_EXP_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+source "$RUN_EXP_DIR/scripts/utils/common.sh"
+
 DATASET="${1:-pcie-heavy}"
 shift 2>/dev/null || true
 
@@ -64,6 +67,9 @@ for i in "${!QPS_LIST[@]}"; do
     echo "========================================"
     echo "[$RUN_NUM/$TOTAL] QPS=$QPS × $REPEATS repeats  ($(date))"
     echo "========================================"
+
+    # 等待 GPU 空闲后再启动
+    wait_for_idle_gpus 2 100 60
 
     if [[ "$REPEATS" -gt 1 ]]; then
         # 使用重复脚本

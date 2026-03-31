@@ -200,6 +200,13 @@ if [[ "$DATASET" == "pcie-full" || "$DATASET" == "pcie-trace-a-light" ]]; then
     PCIE_FULL_RUNNER_TIMEOUT_ARGS=(--request-timeout "$REQUEST_TIMEOUT")
 fi
 
+# 可选: 限制单请求最大生成 token 数
+MAX_OUTPUT_ARGS=()
+if [[ -n "$MAX_OUTPUT" ]]; then
+    MAX_OUTPUT_ARGS=(--max-output-tokens "$MAX_OUTPUT")
+    echo "✓ Max output tokens: $MAX_OUTPUT"
+fi
+
 # ============================================================
 # 路径设置
 # ============================================================
@@ -287,6 +294,7 @@ python3 prefetch_ab_runner.py \
     --output "$RESULTS_DIR/prefetch_pcie_sched.jsonl" \
     --seed "$SEED" \
     "${PCIE_FULL_RUNNER_TIMEOUT_ARGS[@]}" \
+    "${MAX_OUTPUT_ARGS[@]}" \
     --prefetch-lead-time "$PREFETCH_LEAD_TIME" \
     --schedule-mode "$SCHEDULE_MODE" \
     2>&1 | tee "$RESULTS_DIR/prefetch_pcie_sched.log"
@@ -330,6 +338,7 @@ python3 prefetch_ab_runner.py \
     --output "$RESULTS_DIR/prefetch_baseline.jsonl" \
     --seed "$SEED" \
     "${PCIE_FULL_RUNNER_TIMEOUT_ARGS[@]}" \
+    "${MAX_OUTPUT_ARGS[@]}" \
     --prefetch-lead-time "$PREFETCH_LEAD_TIME" \
     --schedule-mode "$SCHEDULE_MODE" \
     2>&1 | tee "$RESULTS_DIR/prefetch_baseline.log"

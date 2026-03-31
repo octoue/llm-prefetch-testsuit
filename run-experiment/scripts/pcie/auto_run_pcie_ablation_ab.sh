@@ -206,6 +206,13 @@ if [[ "$DATASET" == "pcie-full" || "$DATASET" == "pcie-trace-a-light" || "$DATAS
     RUNNER_TIMEOUT_ARGS=(--request-timeout "$REQUEST_TIMEOUT")
 fi
 
+# 可选: 限制单请求最大生成 token 数
+MAX_OUTPUT_ARGS=()
+if [[ -n "$MAX_OUTPUT" ]]; then
+    MAX_OUTPUT_ARGS=(--max-output-tokens "$MAX_OUTPUT")
+    echo "✓ Max output tokens: $MAX_OUTPUT"
+fi
+
 # ============================================================
 # 路径设置
 # ============================================================
@@ -294,6 +301,7 @@ run_phase() {
         --output "$RESULTS_DIR/prefetch_${SUFFIX}.jsonl" \
         --seed "$SEED" \
         "${RUNNER_TIMEOUT_ARGS[@]}" \
+        "${MAX_OUTPUT_ARGS[@]}" \
         --prefetch-lead-time "$PREFETCH_LEAD_TIME" \
         --schedule-mode "$SCHEDULE_MODE" \
         2>&1 | tee "$RESULTS_DIR/prefetch_${SUFFIX}.log"
