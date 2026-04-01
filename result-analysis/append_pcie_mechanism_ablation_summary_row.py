@@ -260,17 +260,35 @@ def build_row(
     return "\t".join(tsv_cell(str(c)) for c in cells)
 
 
+def _normalize_group_token(raw: str) -> str:
+    """Strip whitespace/CR; map lone 0/1 to g0/g1 (common typo or wrong $VAR)."""
+    t = raw.strip().lower().replace("\r", "")
+    if t in ("0",):
+        return "g0"
+    if t in ("1",):
+        return "g1"
+    return t
+
+
 def resolve_groups(groups_csv: str) -> list[tuple[str, str, str]]:
-    requested = {x.strip().lower() for x in groups_csv.split(",") if x.strip()}
+    requested = {
+        _normalize_group_token(x)
+        for x in groups_csv.split(",")
+        if x.strip()
+    }
     if not requested:
         raise SystemExit("empty --groups")
+    valid_ids = {g[0].lower() for g in MECH_GROUP_DEFS}
     out: list[tuple[str, str, str]] = []
     for gid, suffix, desc in MECH_GROUP_DEFS:
         if gid.lower() in requested:
             out.append((gid, suffix, desc))
-    unknown = requested - {g[0].lower() for g in MECH_GROUP_DEFS}
+    unknown = requested - valid_ids
     if unknown:
-        raise SystemExit(f"unknown group id(s) in --groups: {sorted(unknown)}")
+        raise SystemExit(
+            f"unknown group id(s) in --groups: {sorted(unknown)}. "
+            f"Valid: {', '.join(sorted(valid_ids))}"
+        )
     if not out:
         raise SystemExit("no groups matched MECH_GROUP_DEFS")
     return out
