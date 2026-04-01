@@ -12,6 +12,8 @@
 #   ./auto_run_pcie_ablation_ab.sh pcie-medium
 #   ./auto_run_pcie_ablation_ab.sh pcie-medium --qps 3.0
 #   ./auto_run_pcie_ablation_ab.sh pcie-heavy --qps 1.5 --gpu-blocks 1000
+#   ./auto_run_pcie_ablation_ab.sh pcie-heavy --qps 2.0 --gpu-blocks 500 --groups g1
+#   ./auto_run_pcie_ablation_ab.sh pcie-heavy --qps 2.0 --groups g1,g0
 
 set -eo pipefail
 
@@ -141,18 +143,25 @@ shift 2>/dev/null || true
 
 # 解析选项
 NUM_GPU_BLOCKS_OVERRIDE_SET=0
+RUN_GROUPS="g0,g1,g2,g3"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --qps)             QPS="$2"; shift 2 ;;
         --lead-time)       PREFETCH_LEAD_TIME="$2"; shift 2 ;;
         --gpu-blocks)      NUM_GPU_BLOCKS_OVERRIDE="$2"; NUM_GPU_BLOCKS_OVERRIDE_SET=1; shift 2 ;;
+        --groups)          RUN_GROUPS="$(echo "$2" | tr '[:upper:]' '[:lower:]')"; shift 2 ;;
         *)
             echo "❌ Unknown option: $1"
-            echo "Usage: $0 [dataset] [--qps N] [--lead-time N] [--gpu-blocks N]"
+            echo "Usage: $0 [dataset] [--qps N] [--lead-time N] [--gpu-blocks N] [--groups g0,g1,g2,g3]"
             exit 1 ;;
     esac
 done
+
+# Helper: 检查是否要运行指定的 group
+should_run_group() {
+    [[ ",$RUN_GROUPS," == *",$1,"* ]]
+}
 
 load_dataset_config "$DATASET"
 [[ $NUM_GPU_BLOCKS_OVERRIDE_SET -eq 0 ]] && NUM_GPU_BLOCKS_OVERRIDE="${DATASET_GPU_BLOCKS:-$NUM_GPU_BLOCKS_OVERRIDE}"
@@ -263,14 +272,15 @@ echo "Num conversations: $NUM_CONV"
 echo "QPS: $QPS"
 echo "Prefetch lead time: ${PREFETCH_LEAD_TIME}s"
 echo "GPU blocks: $NUM_GPU_BLOCKS_OVERRIDE"
+echo "Run groups: $RUN_GROUPS"
 echo "Run directory: $RESULTS_DIR"
 print_separator
 echo ""
 echo "Groups:"
-echo "  G3: PCIe Scheduler + PP Phase-Aware   (start_vllm_pcie.sh --pcie-scheduler)"
-echo "  G2: PCIe Scheduler, no Phase-Aware    (start_vllm_pcie.sh --pcie-scheduler --no-pp-phase-aware)"
-echo "  G1: No Scheduler, with Prefetch       (start_vllm_pcie.sh)"
-echo "  G0: No Scheduler, no Prefetch         (start_vllm_pcie.sh, --mode baseline)"
+should_run_group g3 && echo "  G3: PCIe Scheduler + PP Phase-Aware   (start_vllm_pcie.sh --pcie-scheduler)"
+should_run_group g2 && echo "  G2: PCIe Scheduler, no Phase-Aware    (start_vllm_pcie.sh --pcie-scheduler --no-pp-phase-aware)"
+should_run_group g1 && echo "  G1: No Scheduler, with Prefetch       (start_vllm_pcie.sh)"
+should_run_group g0 && echo "  G0: No Scheduler, no Prefetch         (start_vllm_pcie.sh, --mode baseline)"
 print_separator
 
 # ============================================================
@@ -319,55 +329,64 @@ run_phase() {
 # Phase 1: G3 — Full scheduling (PCIe Scheduler + PP Phase-Aware)
 # ============================================================
 
-start_vllm g3 --pcie-scheduler --gpu-blocks "$NUM_GPU_BLOCKS_OVERRIDE" --log-file "$RESULTS_DIR/vllm_log_g3.log" || exit 1
+VLLM_RUNNING_CONFIG=""   # 追踪当前 vLLM 的配置: "scheduler", "scheduler_no_phase", "no_scheduler"
 
-print_phase "[Phase 1/5] G3: Prefetch + PCIe Scheduler + PP Phase-Aware"
-run_phase "G3" "prefetch" "g3_full_sched"
+if should_run_group g3; then
+    start_vllm g3 --pcie-scheduler --gpu-blocks "$NUM_GPU_BLOCKS_OVERRIDE" --log-file "$RESULTS_DIR/vllm_log_g3.log" || exit 1
+    VLLM_RUNNING_CONFIG="scheduler"
 
-# ============================================================
-# Phase 1 → Phase 2: 重启 vLLM (--pcie-scheduler --no-pp-phase-aware)
-# ============================================================
-
-print_phase "Restarting vLLM for Phase 2 (--pcie-scheduler --no-pp-phase-aware)..."
-stop_vllm
-start_vllm g2 --pcie-scheduler --no-pp-phase-aware --gpu-blocks "$NUM_GPU_BLOCKS_OVERRIDE" --log-file "$RESULTS_DIR/vllm_log_g2.log" || exit 1
+    print_phase "[G3] Prefetch + PCIe Scheduler + PP Phase-Aware"
+    run_phase "G3" "prefetch" "g3_full_sched"
+fi
 
 # ============================================================
 # Phase 2: G2 — Scheduler ON, Phase-Aware OFF
 # ============================================================
 
-print_phase "[Phase 2/5] G2: Prefetch + PCIe Scheduler, NO PP Phase-Aware"
-run_phase "G2" "prefetch" "g2_sched_no_phase"
+if should_run_group g2; then
+    if [[ "$VLLM_RUNNING_CONFIG" != "scheduler_no_phase" ]]; then
+        [[ -n "$VLLM_RUNNING_CONFIG" ]] && stop_vllm
+        start_vllm g2 --pcie-scheduler --no-pp-phase-aware --gpu-blocks "$NUM_GPU_BLOCKS_OVERRIDE" --log-file "$RESULTS_DIR/vllm_log_g2.log" || exit 1
+        VLLM_RUNNING_CONFIG="scheduler_no_phase"
+    fi
 
-# ============================================================
-# Phase 2 → Phase 3: 重启 vLLM（不带 --pcie-scheduler）
-# ============================================================
-
-print_phase "Restarting vLLM for Phase 3 (no scheduler)..."
-stop_vllm
-start_vllm g1_g0 --gpu-blocks "$NUM_GPU_BLOCKS_OVERRIDE" --log-file "$RESULTS_DIR/vllm_log_g1_g0.log" || exit 1
+    print_phase "[G2] Prefetch + PCIe Scheduler, NO PP Phase-Aware"
+    run_phase "G2" "prefetch" "g2_sched_no_phase"
+fi
 
 # ============================================================
 # Phase 3: G1 — No Scheduler, with Prefetch
 # ============================================================
 
-print_phase "[Phase 3/5] G1: Prefetch, no PCIe Scheduler (baseline prefetch)"
-run_phase "G1" "prefetch" "g1_prefetch_only"
+if should_run_group g1 || should_run_group g0; then
+    if [[ "$VLLM_RUNNING_CONFIG" != "no_scheduler" ]]; then
+        [[ -n "$VLLM_RUNNING_CONFIG" ]] && stop_vllm
+        start_vllm g1_g0 --gpu-blocks "$NUM_GPU_BLOCKS_OVERRIDE" --log-file "$RESULTS_DIR/vllm_log_g1_g0.log" || exit 1
+        VLLM_RUNNING_CONFIG="no_scheduler"
+    fi
+fi
+
+if should_run_group g1; then
+    print_phase "[G1] Prefetch, no PCIe Scheduler (baseline prefetch)"
+    run_phase "G1" "prefetch" "g1_prefetch_only"
+fi
 
 # ============================================================
 # Phase 4: G0 — No Scheduler, No Prefetch (same vLLM instance as G1)
 # ============================================================
 
-print_phase "[Phase 4/5] G0: No Prefetch, no Scheduler (original vLLM baseline)"
+if should_run_group g0; then
+    print_phase "[G0] No Prefetch, no Scheduler (original vLLM baseline)"
 
-echo "Resetting prefix cache before G0..."
-curl -s -X POST "http://localhost:$API_PORT/reset_prefix_cache?reset_external=true" >/dev/null || true
-sleep 5
+    echo "Resetting prefix cache before G0..."
+    curl -s -X POST "http://localhost:$API_PORT/reset_prefix_cache?reset_external=true" >/dev/null || true
+    sleep 5
 
-run_phase "G0" "baseline" "g0_no_prefetch"
+    run_phase "G0" "baseline" "g0_no_prefetch"
+fi
 
 # 停止 vLLM
-stop_vllm
+[[ -n "$VLLM_RUNNING_CONFIG" ]] && stop_vllm
 
 # ============================================================
 # Phase 5: 生成报告

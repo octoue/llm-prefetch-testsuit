@@ -8,6 +8,7 @@
 #   --rounds N         全部 QPS 跑 N 轮（默认 1），每轮按 QPS 从小到大依次执行
 #   --gpu-blocks N     覆盖 GPU blocks
 #   --qps-list "..."   自定义 QPS 列表（空格分隔，需引号括起来）
+#   --groups "..."     只跑指定的 group（逗号分隔，如 g1 或 g1,g0）
 #
 # 示例:
 #   # 每个 QPS 跑 1 次
@@ -18,6 +19,9 @@
 #
 #   # 自定义 QPS 列表 + 3 轮
 #   nohup bash scripts/pcie/batch_run_qps.sh pcie-heavy --rounds 3 --qps-list "0.5 1.0 1.5 2.0 2.5" --gpu-blocks 1000 > batch.log 2>&1 &
+#
+#   # 只跑 G1
+#   nohup bash scripts/pcie/batch_run_qps.sh pcie-heavy --gpu-blocks 500 --qps-list "2.0" --groups g1 > batch.log 2>&1 &
 #
 # 合上电脑也不会断。查看进度: tail -f batch.log / batch_qps.log
 
@@ -32,6 +36,7 @@ shift 2>/dev/null || true
 
 ROUNDS=1
 QPS_LIST=(0.5 1.0 1.5 2.0 2.5 3.0 3.5 4.0)
+GROUPS=""
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -43,10 +48,17 @@ while [[ $# -gt 0 ]]; do
             ROUNDS="$2"; shift 2 ;;
         --qps-list)
             IFS=' ' read -r -a QPS_LIST <<< "$2"; shift 2 ;;
+        --groups)
+            GROUPS="$2"; shift 2 ;;
         *)
             EXTRA_ARGS+=("$1"); shift ;;
     esac
 done
+
+# 将 --groups 转发给 auto_run_pcie_ablation_ab.sh
+if [[ -n "$GROUPS" ]]; then
+    EXTRA_ARGS+=(--groups "$GROUPS")
+fi
 
 NUM_QPS=${#QPS_LIST[@]}
 TOTAL_RUNS=$((NUM_QPS * ROUNDS))
@@ -58,6 +70,7 @@ echo "========================================"
 echo "Dataset:    $DATASET"
 echo "QPS values: ${QPS_LIST[*]}"
 echo "Rounds:     $ROUNDS"
+echo "Groups:     ${GROUPS:-all (g0,g1,g2,g3)}"
 echo "Extra args: ${EXTRA_ARGS[*]}"
 echo "Total runs: $NUM_QPS QPS × $ROUNDS rounds = $TOTAL_RUNS ablation runs"
 echo "Start time: $(date)"
