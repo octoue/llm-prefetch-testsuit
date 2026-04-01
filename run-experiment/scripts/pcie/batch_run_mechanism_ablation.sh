@@ -44,6 +44,7 @@ DATASET="${1:-pcie-heavy}"
 shift 2>/dev/null || true
 
 ROUNDS=1
+GPU_BLOCKS=""
 QPS_LIST=(1.0 1.5 2.0 2.5)
 GROUPS=""
 EXTRA_ARGS=()
@@ -52,6 +53,8 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --rounds)
             ROUNDS="$2"; shift 2 ;;
+        --gpu-blocks)
+            GPU_BLOCKS="$2"; shift 2 ;;
         --qps-list)
             IFS=' ' read -r -a QPS_LIST <<< "$2"; shift 2 ;;
         --groups)
@@ -61,6 +64,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ -n "$GPU_BLOCKS" ]]; then
+    EXTRA_ARGS+=(--gpu-blocks "$GPU_BLOCKS")
+fi
 if [[ -n "$GROUPS" ]]; then
     EXTRA_ARGS+=(--groups "$GROUPS")
 fi
@@ -75,6 +81,7 @@ echo "========================================"
 echo "Dataset:    $DATASET"
 echo "QPS values: ${QPS_LIST[*]}"
 echo "Rounds:     $ROUNDS"
+echo "GPU blocks: ${GPU_BLOCKS:-<from config>}"
 echo "Groups:     ${GROUPS:-no-pq,no-ef,no-cc (default)}"
 echo "Extra args: ${EXTRA_ARGS[*]}"
 echo "Total runs: $NUM_QPS QPS x $ROUNDS rounds = $TOTAL_RUNS ablation runs"

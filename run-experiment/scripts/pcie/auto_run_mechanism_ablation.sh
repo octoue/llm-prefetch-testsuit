@@ -147,10 +147,11 @@ while [[ $# -gt 0 ]]; do
         --lead-time)       PREFETCH_LEAD_TIME="$2"; shift 2 ;;
         --gpu-blocks)      NUM_GPU_BLOCKS_OVERRIDE="$2"; NUM_GPU_BLOCKS_OVERRIDE_SET=1; shift 2 ;;
         --groups)
-            if [[ "$2" == "all" ]]; then
+            _g="$(echo "$2" | tr '[:upper:]' '[:lower:]')"
+            if [[ "$_g" == "all" ]]; then
                 RUN_GROUPS="g0,g1,full,no-pq,no-ef,no-cc"
             else
-                RUN_GROUPS="$(echo "$2" | tr '[:upper:]' '[:lower:]')"
+                RUN_GROUPS="$_g"
             fi
             shift 2 ;;
         *)
@@ -268,14 +269,22 @@ echo "Groups: $RUN_GROUPS"
 echo "Results: $RESULTS_DIR"
 print_separator
 echo ""
+ACTIVE_GROUP_COUNT=0
 echo "Groups:"
-should_run_group full   && echo "  full:   Priority heap, CC=2, Evict-first ON    (complete scheduler)"
-should_run_group no-pq  && echo "  no-pq:  FIFO queue, CC=2, Evict-first ON      (no priority)"
-should_run_group no-ef  && echo "  no-ef:  Priority heap, CC=2, Evict-first OFF   (no evict-first)"
-should_run_group no-cc  && echo "  no-cc:  Priority heap, CC=999, Evict-first ON  (no concurrency ctrl)"
-should_run_group g1     && echo "  g1:     no scheduler, prefetch only"
-should_run_group g0     && echo "  g0:     no scheduler, no prefetch (baseline)"
+should_run_group full   && echo "  full:   Priority heap, CC=2, Evict-first ON    (complete scheduler)" && ((ACTIVE_GROUP_COUNT++)) || true
+should_run_group no-pq  && echo "  no-pq:  FIFO queue, CC=2, Evict-first ON      (no priority)"       && ((ACTIVE_GROUP_COUNT++)) || true
+should_run_group no-ef  && echo "  no-ef:  Priority heap, CC=2, Evict-first OFF   (no evict-first)"    && ((ACTIVE_GROUP_COUNT++)) || true
+should_run_group no-cc  && echo "  no-cc:  Priority heap, CC=999, Evict-first ON  (no concurrency ctrl)" && ((ACTIVE_GROUP_COUNT++)) || true
+should_run_group g1     && echo "  g1:     no scheduler, prefetch only"                                 && ((ACTIVE_GROUP_COUNT++)) || true
+should_run_group g0     && echo "  g0:     no scheduler, no prefetch (baseline)"                        && ((ACTIVE_GROUP_COUNT++)) || true
+echo "Active groups: $ACTIVE_GROUP_COUNT"
 print_separator
+
+if [[ "$ACTIVE_GROUP_COUNT" -eq 0 ]]; then
+    echo "❌ Error: No groups matched RUN_GROUPS='$RUN_GROUPS'"
+    echo "   Valid groups: full, no-pq, no-ef, no-cc, g1, g0 (or 'all')"
+    exit 1
+fi
 
 # ============================================================
 # run_phase: 运行单个实验阶段
