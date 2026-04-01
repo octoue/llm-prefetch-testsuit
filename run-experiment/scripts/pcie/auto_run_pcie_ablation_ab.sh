@@ -161,7 +161,7 @@ generate_dataset_if_needed "$TRACE" "$FULL_TRACE" "$DATASET" || exit 1
 
 # Timeout 配置
 RUNNER_TIMEOUT_ARGS=(--timeout "$TIMEOUT" --request-timeout "$REQUEST_TIMEOUT")
-if [[ "$DATASET" == "pcie-full" || "$DATASET" == "pcie-trace-a-light" || "$DATASET" == "pcie-multiturn" ]]; then
+if [[ "$DATASET" == "pcie-full" || "$DATASET" == "pcie-trace-a-light" || "$DATASET" == "pcie-multiturn" || "$DATASET" == "pcie-heavy" ]]; then
     if [[ ! -f "$TRACE" ]]; then
         echo "❌ $DATASET: trace 不存在: $TRACE"
         exit 1

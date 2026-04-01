@@ -64,7 +64,7 @@ generate_dataset_if_needed "$TRACE" "$FULL_TRACE" "$DATASET" || exit 1
 
 # pcie-full / pcie-trace-a-light / pcie-multiturn：大数据集特殊处理（禁用全局 timeout）
 PCIE_FULL_RUNNER_TIMEOUT_ARGS=(--timeout "$TIMEOUT" --request-timeout "$REQUEST_TIMEOUT")
-if [[ "$DATASET" == "pcie-full" || "$DATASET" == "pcie-trace-a-light" || "$DATASET" == "pcie-multiturn" ]]; then
+if [[ "$DATASET" == "pcie-full" || "$DATASET" == "pcie-trace-a-light" || "$DATASET" == "pcie-multiturn" || "$DATASET" == "pcie-heavy" ]]; then
     if [[ ! -f "$TRACE" ]]; then
         echo "❌ $DATASET: trace 不存在: $TRACE"
         exit 1
@@ -167,7 +167,7 @@ echo "Num conversations: $NUM_CONV"
 echo "QPS: $QPS"
 echo "Prefetch lead time: ${PREFETCH_LEAD_TIME}s"
 echo "GPU blocks: $NUM_GPU_BLOCKS_OVERRIDE"
-if [[ "$DATASET" == "pcie-full" || "$DATASET" == "pcie-trace-a-light" || "$DATASET" == "pcie-multiturn" ]]; then
+if [[ "$DATASET" == "pcie-full" || "$DATASET" == "pcie-trace-a-light" || "$DATASET" == "pcie-multiturn" || "$DATASET" == "pcie-heavy" ]]; then
     echo "Runner timeouts: ${PCIE_FULL_RUNNER_TIMEOUT_ARGS[*]} (no global phase timeout)"
 else
     echo "Runner timeouts: TIMEOUT=${TIMEOUT}s REQUEST_TIMEOUT=${REQUEST_TIMEOUT}s"
