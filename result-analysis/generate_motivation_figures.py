@@ -1,30 +1,17 @@
 #!/usr/bin/env python3
 """
 Motivation Section Figure Generator for PCIe Scheduling Paper.
+Publication-quality figures for OSDI/SOSP style.
 
-Generates 4 figures for the motivation section:
-  M1: H2D transfer latency CDF — overlapped vs. non-overlapped with PP communication
-  M2: PCIe transfer timeline (Gantt) — showing IDLE windows and contention
-  M3: TTFT CDF — unscheduled vs. scheduled (multi-group)
-  M4: PCIe bandwidth utilization vs. H2D transfer latency scatter
+Generates 3 figures (G1-only, problem characterization):
+  Fig1: PCIe Contention & Priority Inversion (stacked area + bar chart)
+  Fig2: TTFT Long-Tail CDF (Turn 1 vs Turn 2-5)
+  Fig3: PCIe Utilization Heatmap (full trace)
 
 Usage:
-  # Use a single experiment directory (auto-detect g0/g1/g2/g3 files):
-  python generate_motivation_figures.py --exp-dir /path/to/ablation_result_dir/ --output figures/
-
-  # Or specify files explicitly:
   python generate_motivation_figures.py \
-    --baseline-trace pcie_events_g1_prefetch_only.json \
-    --sched-trace pcie_events_g3_full_sched.json \
-    --ttft-files "G0:prefetch_g0.jsonl" "G1:prefetch_g1.jsonl" "G2:prefetch_g2.jsonl" "G3:prefetch_g3.jsonl" \
-    --output figures/
-
-  # Select which figures to generate:
-  python generate_motivation_figures.py --exp-dir ... --figures m1 m2 m3 m4
-
-  # M2 timeline window control:
-  python generate_motivation_figures.py --exp-dir ... --figures m2 \
-    --window-start 50000 --window-duration 200
+    --exp-dir ablation-results-heavy/20260401_011635_*/ \
+    --output claude-docs/motivation-figures/
 """
 
 import argparse
@@ -36,45 +23,38 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import matplotlib.ticker as mticker
+from matplotlib.patches import FancyArrowPatch
 import numpy as np
 
 # ============================================================
-# Style
+# Global Style — OSDI/SOSP publication quality
 # ============================================================
 plt.rcParams.update({
-    "font.size": 10,
-    "axes.labelsize": 11,
-    "axes.titlesize": 12,
-    "legend.fontsize": 9,
-    "xtick.labelsize": 9,
-    "ytick.labelsize": 9,
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "DejaVu Serif"],
+    "font.size": 12,
+    "axes.labelsize": 13,
+    "axes.titlesize": 14,
+    "legend.fontsize": 10,
+    "xtick.labelsize": 11,
+    "ytick.labelsize": 11,
     "figure.dpi": 150,
     "savefig.dpi": 300,
-    "font.family": "serif",
+    "pdf.fonttype": 42,       # embed fonts in PDF
+    "ps.fonttype": 42,
+    "axes.linewidth": 0.8,
+    "grid.linewidth": 0.5,
+    "lines.linewidth": 1.5,
 })
 
-COLOR_MAP = {
-    "Prefetch": "#2ecc71",
-    "Restore": "#e67e22",
-    "Evict": "#95a5a6",
-    "PP_P2P_Send": "#3498db",
-    "PP_P2P_Recv": "#85c1e9",
-    "PP_TP_AllGather_Reconstruct": "#9b59b6",
-}
-
-GROUP_COLORS = {
-    "G0": "#95a5a6",
-    "G1": "#e74c3c",
-    "G2": "#3498db",
-    "G3": "#2ecc71",
-}
-
-GROUP_LABELS = {
-    "G0": "Baseline (no prefetch)",
-    "G1": "Prefetch only",
-    "G2": "Scheduler (no phase-aware)",
-    "G3": "Full system",
-}
+# Color semantics (per task_draw_motivation_pic.md)
+C_RESTORE = "#C0392B"   # red/dark orange — critical path
+C_PREFETCH = "#2980B9"  # blue — non-critical background
+C_EVICT = "#95A5A6"     # gray
+C_PP_RECV = "#BDC3C7"   # light gray — PP communication background
+C_WARN = "#E74C3C"      # red — warning/alert
+C_OK = "#27AE60"        # green — correct/good
 
 
 # ============================================================
@@ -87,621 +67,513 @@ def load_events(path: str) -> list[dict]:
     for e in events:
         if "end_us" not in e:
             e["end_us"] = e["start_us"] + e["duration_ms"] * 1000
+        if "start_ms" not in e:
+            e["start_ms"] = e["start_us"] / 1000.0
     return events
 
 
-def load_ttft(path: str) -> np.ndarray:
-    ttfts = []
+def load_ttft(path: str) -> list[dict]:
+    records = []
     with open(path) as f:
         for line in f:
             d = json.loads(line)
-            val = d.get("ttft_ms")
-            if val is not None and d.get("success", True):
-                ttfts.append(val)
-    return np.array(ttfts)
+            if d.get("ttft_ms") is not None and d.get("success", True):
+                records.append(d)
+    return records
 
 
 # ============================================================
-# M1: H2D Traffic Characterization & Scheduling Opportunity
+# Helpers
 # ============================================================
-def figure_m1(trace_paths: dict[str, str], output_dir: str):
-    """M1: H2D traffic characterization across experimental groups.
+def _find_priority_inversion_pairs(events: list[dict], window_us: int = 50_000):
+    """Find (prefetch, restore) pairs where prefetch started first within window."""
+    restores = sorted([e for e in events if e["op_type"] == "Restore"],
+                      key=lambda x: x["start_us"])
+    prefetches = sorted([e for e in events if e["op_type"] == "Prefetch"],
+                        key=lambda x: x["start_us"])
 
-    Panel (a): H2D transfer count and volume by group — shows Prefetch adds
-               significant traffic that needs to be managed.
-    Panel (b): Restore latency CDF across groups — shows the impact of
-               uncoordinated traffic on critical-path transfers.
+    prefetch_first = []
+    restore_first = []
+    pf_idx = 0
+    for r in restores:
+        while pf_idx < len(prefetches) and prefetches[pf_idx]["start_us"] < r["start_us"] - window_us:
+            pf_idx += 1
+        j = pf_idx
+        while j < len(prefetches) and prefetches[j]["start_us"] <= r["start_us"] + window_us:
+            p = prefetches[j]
+            if p.get("gpu_id") == r.get("gpu_id"):
+                if p["start_us"] < r["start_us"]:
+                    prefetch_first.append((p, r))
+                else:
+                    restore_first.append((r, p))
+            j += 1
+    return prefetch_first, restore_first
+
+
+def _find_best_inversion_example(events: list[dict], prefetch_first: list):
+    """Find the best priority inversion example for visualization.
+
+    Prefer cases with:
+    1. Moderate gap (3-15ms) — visible but not extreme
+    2. Both transfers have substantial duration
+    3. Clear overlap period
     """
-    groups_data = {}
-    for label, path in trace_paths.items():
-        events = load_events(path)
-        restore = [e for e in events if e["op_type"] == "Restore"]
-        prefetch = [e for e in events if e["op_type"] == "Prefetch"]
-        evict = [e for e in events if e["op_type"] == "Evict"]
-        groups_data[label] = {
-            "restore": restore,
-            "prefetch": prefetch,
-            "evict": evict,
-            "restore_lats": np.array([e["duration_ms"] for e in restore]) if restore else np.array([]),
-            "prefetch_lats": np.array([e["duration_ms"] for e in prefetch]) if prefetch else np.array([]),
-            "restore_bytes": sum(e.get("wire_bytes", e["size_bytes"]) for e in restore),
-            "prefetch_bytes": sum(e.get("wire_bytes", e["size_bytes"]) for e in prefetch),
-        }
+    candidates = []
+    for p, r in prefetch_first:
+        gap_ms = (r["start_us"] - p["start_us"]) / 1000.0
+        overlap_start = max(p["start_us"], r["start_us"])
+        overlap_end = min(p["end_us"], r["end_us"])
+        overlap_ms = max(0, (overlap_end - overlap_start) / 1000.0)
+        if 2 < gap_ms < 15 and p["duration_ms"] > 5 and r["duration_ms"] > 5 and overlap_ms > 3:
+            candidates.append((gap_ms, overlap_ms, p, r))
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
-    groups_sorted = sorted(groups_data.keys())
+    if candidates:
+        # Pick one with good visual balance
+        candidates.sort(key=lambda x: x[1], reverse=True)  # most overlap
+        return candidates[0][2], candidates[0][3]
 
-    # --- Panel (a): Stacked bar chart of H2D traffic ---
-    x = np.arange(len(groups_sorted))
+    # Fallback: pick by largest gap with overlap
+    for p, r in sorted(prefetch_first, key=lambda pr: pr[1]["start_us"] - pr[0]["start_us"], reverse=True):
+        if min(p["end_us"], r["end_us"]) > max(p["start_us"], r["start_us"]):
+            return p, r
+    return prefetch_first[0] if prefetch_first else (None, None)
+
+
+# ============================================================
+# Figure 1: PCIe Contention & Priority Inversion
+# ============================================================
+def figure_1(trace_path: str, output_dir: str):
+    """Fig1: Stacked area timeline + macro statistics.
+
+    Panel (a): Stacked area chart showing bandwidth contention during
+               a priority inversion event (~100ms window).
+    Panel (b): Bar chart showing scheduling order stats + traffic volume.
+    """
+    events = load_events(trace_path)
+    prefetch_first, restore_first = _find_priority_inversion_pairs(events)
+    pf_count = len(prefetch_first)
+    rf_count = len(restore_first)
+    total = pf_count + rf_count
+
+    print(f"[Fig1] Priority inversion: {pf_count}/{total} prefetch-first "
+          f"({pf_count/total*100:.1f}%)" if total > 0 else "[Fig1] No pairs")
+
+    # Find best example
+    pf_ex, rs_ex = _find_best_inversion_example(events, prefetch_first)
+
+    fig, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(12, 4),
+                                      gridspec_kw={"width_ratios": [1.6, 1]},
+                                      constrained_layout=True)
+
+    # ===== Panel (a): Stacked Area Timeline =====
+    if pf_ex and rs_ex:
+        gpu_id = pf_ex.get("gpu_id", 1)
+        # Define window: center on the inversion event, ~120ms total
+        center_us = (pf_ex["start_us"] + rs_ex["end_us"]) / 2
+        half_win = 60_000  # 60ms each side
+        win_start_us = center_us - half_win
+        win_end_us = center_us + half_win
+
+        # Collect all H2D events on this GPU in window
+        h2d_window = [
+            e for e in events
+            if e["op_type"] in ("Prefetch", "Restore")
+            and e.get("gpu_id") == gpu_id
+            and e["end_us"] > win_start_us and e["start_us"] < win_end_us
+        ]
+        pp_window = [
+            e for e in events
+            if e["op_type"] == "PP_P2P_Recv"
+            and e.get("gpu_id") == gpu_id
+            and e["end_us"] > win_start_us and e["start_us"] < win_end_us
+        ]
+
+        # Build stacked area: sample at 0.1ms resolution
+        win_dur_ms = (win_end_us - win_start_us) / 1000.0
+        dt = 0.1  # ms
+        t_points = np.arange(0, win_dur_ms, dt)
+        bw_prefetch = np.zeros_like(t_points)
+        bw_restore = np.zeros_like(t_points)
+
+        for e in h2d_window:
+            rel_start = (e["start_us"] - win_start_us) / 1000.0
+            rel_end = (e["end_us"] - win_start_us) / 1000.0
+            bw = e.get("bandwidth_gbps", 0)
+            if bw <= 0:
+                bw = e.get("size_bytes", 0) / 1e9 / (e["duration_ms"] / 1000.0) if e["duration_ms"] > 0 else 0
+            mask = (t_points >= rel_start) & (t_points < rel_end)
+            if e["op_type"] == "Prefetch":
+                bw_prefetch[mask] += bw
+            else:
+                bw_restore[mask] += bw
+
+        # Draw PP_Recv as gray background bands
+        for e in pp_window:
+            rel_start = max(0, (e["start_us"] - win_start_us) / 1000.0)
+            rel_end = min(win_dur_ms, (e["end_us"] - win_start_us) / 1000.0)
+            ax_a.axvspan(rel_start, rel_end, alpha=0.12, color=C_PP_RECV, zorder=0)
+
+        # Stacked area
+        ax_a.fill_between(t_points, 0, bw_prefetch,
+                          color=C_PREFETCH, alpha=0.7, label="Prefetch (non-critical)",
+                          linewidth=0, zorder=1)
+        ax_a.fill_between(t_points, bw_prefetch, bw_prefetch + bw_restore,
+                          color=C_RESTORE, alpha=0.8, label="Restore (critical path)",
+                          linewidth=0, zorder=2)
+
+        # Draw arrival arrows at top
+        arrow_y = max(np.max(bw_prefetch + bw_restore) * 1.05, 22)
+        pf_rel = (pf_ex["start_us"] - win_start_us) / 1000.0
+        rs_rel = (rs_ex["start_us"] - win_start_us) / 1000.0
+
+        ax_a.annotate("", xy=(pf_rel, arrow_y * 0.85), xytext=(pf_rel, arrow_y * 1.05),
+                      arrowprops=dict(arrowstyle="-|>", color=C_PREFETCH, lw=2))
+        ax_a.text(pf_rel, arrow_y * 1.08, "Prefetch\narrives", ha="center", va="bottom",
+                  fontsize=9, color=C_PREFETCH, fontweight="bold")
+
+        ax_a.annotate("", xy=(rs_rel, arrow_y * 0.85), xytext=(rs_rel, arrow_y * 1.05),
+                      arrowprops=dict(arrowstyle="-|>", color=C_RESTORE, lw=2))
+        ax_a.text(rs_rel, arrow_y * 1.08, "Restore\narrives", ha="center", va="bottom",
+                  fontsize=9, color=C_RESTORE, fontweight="bold")
+
+        # Highlight the contention zone with hatching
+        overlap_start = max(pf_ex["start_us"], rs_ex["start_us"])
+        overlap_end = min(pf_ex["end_us"], rs_ex["end_us"])
+        if overlap_end > overlap_start:
+            os_rel = (overlap_start - win_start_us) / 1000.0
+            oe_rel = (overlap_end - win_start_us) / 1000.0
+            ax_a.axvspan(os_rel, oe_rel, alpha=0.15, facecolor=C_WARN,
+                         hatch="///", edgecolor=C_WARN, linewidth=0.5, zorder=3,
+                         label="Bandwidth contention")
+
+        # Priority Inversion label
+        gap_ms = (rs_ex["start_us"] - pf_ex["start_us"]) / 1000.0
+        mid_x = (pf_rel + rs_rel) / 2
+        ax_a.text(mid_x, arrow_y * 0.5,
+                  f"Priority Inversion\n({gap_ms:.1f}ms delay)",
+                  ha="center", va="center", fontsize=10, fontweight="bold",
+                  color=C_WARN,
+                  bbox=dict(boxstyle="round,pad=0.3", facecolor="#FDEDEC",
+                            edgecolor=C_WARN, alpha=0.9, linewidth=1.2))
+
+        # PCIe peak line
+        ax_a.axhline(y=25.6, color="gray", linestyle=":", alpha=0.5, linewidth=0.8)
+        ax_a.text(win_dur_ms * 0.99, 25.6, "PCIe Gen4 peak", ha="right", va="bottom",
+                  fontsize=8, color="gray", alpha=0.7)
+
+        ax_a.set_xlabel("Time (ms)")
+        ax_a.set_ylabel("PCIe Bandwidth (GB/s)")
+        ax_a.set_xlim(0, win_dur_ms)
+        ax_a.set_ylim(0, arrow_y * 1.3)
+        ax_a.set_title("(a) PCIe H2D Bandwidth During Priority Inversion")
+        ax_a.legend(fontsize=9, loc="lower right",
+                    framealpha=0.9, edgecolor="gray")
+        ax_a.grid(True, alpha=0.2, axis="y")
+
+        print(f"[Fig1a] Example: Prefetch {pf_ex['duration_ms']:.1f}ms, "
+              f"Restore {rs_ex['duration_ms']:.1f}ms, gap {gap_ms:.1f}ms, GPU{gpu_id}")
+
+    # ===== Panel (b): Macro Statistics =====
+    # Traffic volume
+    restore_all = [e for e in events if e["op_type"] == "Restore"]
+    prefetch_all = [e for e in events if e["op_type"] == "Prefetch"]
+    restore_gb = sum(e.get("wire_bytes", e["size_bytes"]) for e in restore_all) / 1e9
+    prefetch_gb = sum(e.get("wire_bytes", e["size_bytes"]) for e in prefetch_all) / 1e9
+
+    # Two groups of bars
+    x = np.array([0, 1.5])  # positions for two groups
     width = 0.35
 
-    restore_counts = [len(groups_data[g]["restore"]) for g in groups_sorted]
-    prefetch_counts = [len(groups_data[g]["prefetch"]) for g in groups_sorted]
-    restore_gb = [groups_data[g]["restore_bytes"] / 1e9 for g in groups_sorted]
-    prefetch_gb = [groups_data[g]["prefetch_bytes"] / 1e9 for g in groups_sorted]
-
-    # Left bars: transfer count
-    bars_r = ax1.bar(x - width / 2, restore_counts, width * 0.9,
-                     label="Restore", color="#e67e22", alpha=0.8)
-    bars_p = ax1.bar(x - width / 2, prefetch_counts, width * 0.9,
-                     bottom=restore_counts, label="Prefetch", color="#2ecc71", alpha=0.8)
-
-    # Right bars: volume (GB) on twin axis
-    ax1_twin = ax1.twinx()
-    total_gb = [r + p for r, p in zip(restore_gb, prefetch_gb)]
-    ax1_twin.bar(x + width / 2, total_gb, width * 0.9,
-                 color="#3498db", alpha=0.4, label="Total H2D (GB)")
-
-    # Labels
-    for i, (rc, pc) in enumerate(zip(restore_counts, prefetch_counts)):
-        total = rc + pc
-        if total > 0:
-            ax1.text(x[i] - width / 2, total + 5, str(total),
-                     ha="center", va="bottom", fontsize=8, fontweight="bold")
-
-    ax1.set_xticks(x)
-    ax1.set_xticklabels([GROUP_LABELS.get(g, g).replace(" ", "\n")
-                         for g in groups_sorted], fontsize=7)
-    ax1.set_ylabel("Transfer Count", color="#333")
-    ax1_twin.set_ylabel("Total Volume (GB)", color="#3498db")
-    ax1.set_title("(a) H2D Traffic Volume")
-
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax1_twin.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=7, loc="upper left")
-    ax1.grid(True, alpha=0.2, axis="y")
-
-    # --- Panel (b): H2D concurrency & PP overlap for G1 (the problem scenario) ---
-    # Show: in G1 (prefetch only, no scheduler), how many H2D transfers
-    # run concurrently? And how many overlap with PP_Recv?
-    g1_key = "G1" if "G1" in trace_paths else None
-    if g1_key:
-        g1_events = load_events(trace_paths[g1_key])
-        g1_h2d = sorted([e for e in g1_events if e["op_type"] in ("Prefetch", "Restore")],
-                        key=lambda x: x["start_us"])
-        g1_pp_recv = sorted([e for e in g1_events if e["op_type"] == "PP_P2P_Recv"],
-                            key=lambda x: x["start_us"])
-
-        # Compute per-H2D: concurrency count and PP overlap
-        concurrency = []
-        pp_overlap_flag = []  # True if overlaps with PP_Recv on same GPU
-        pp_recv_by_gpu = defaultdict(list)
-        for e in g1_pp_recv:
-            pp_recv_by_gpu[e["gpu_id"]].append(e)
-
-        for i, h in enumerate(g1_h2d):
-            # Count concurrent H2D
-            cnt = sum(1 for j, o in enumerate(g1_h2d)
-                      if j != i and o["start_us"] < h["end_us"] and o["end_us"] > h["start_us"])
-            concurrency.append(cnt)
-            # Check PP overlap on same GPU
-            gpu = h.get("gpu_id", 0)
-            has_pp = any(p["end_us"] > h["start_us"] and p["start_us"] < h["end_us"]
-                         for p in pp_recv_by_gpu.get(gpu, []))
-            pp_overlap_flag.append(has_pp)
-
-        concurrency = np.array(concurrency)
-        pp_overlap_flag = np.array(pp_overlap_flag)
-
-        # Stacked histogram: concurrency by PP overlap status
-        max_conc = int(concurrency.max()) + 1
-        bins = np.arange(-0.5, max_conc + 0.5, 1)
-        conc_no_pp = concurrency[~pp_overlap_flag]
-        conc_pp = concurrency[pp_overlap_flag]
-
-        ax2.hist([conc_no_pp, conc_pp], bins=bins, stacked=True,
-                 color=["#2ecc71", "#e74c3c"], alpha=0.7,
-                 label=[f"IDLE window ({len(conc_no_pp)})",
-                        f"During PP comm ({len(conc_pp)})"],
-                 edgecolor="white", linewidth=0.5)
-
-        ax2.set_xlabel("Concurrent H2D Transfers")
-        ax2.set_ylabel("Count")
-        ax2.set_title("(b) H2D Concurrency (Prefetch Only)")
-        ax2.legend(fontsize=8)
-        ax2.set_xticks(range(max_conc))
-        ax2.grid(True, alpha=0.2, axis="y")
-
-        # Annotate key stats
-        pct_pp = np.sum(pp_overlap_flag) / len(pp_overlap_flag) * 100
-        pct_conc = np.sum(concurrency > 0) / len(concurrency) * 100
-        ax2.text(0.97, 0.95,
-                 f"{pct_pp:.0f}% during PP\n{pct_conc:.0f}% concurrent",
-                 transform=ax2.transAxes, ha="right", va="top",
-                 fontsize=9, fontweight="bold",
-                 bbox=dict(boxstyle="round,pad=0.3", facecolor="wheat", alpha=0.8))
+    # Group 1: Scheduling order (%)
+    if total > 0:
+        pf_pct = pf_count / total * 100
+        rf_pct = rf_count / total * 100
     else:
-        ax2.text(0.5, 0.5, "G1 trace not available", transform=ax2.transAxes,
-                 ha="center", va="center")
+        pf_pct = rf_pct = 0
 
-    fig.suptitle("KV Cache Prefetch Increases H2D Traffic — Scheduling Required",
-                 fontsize=13, y=1.02)
-    fig.tight_layout()
+    bar1_a = ax_b.bar(x[0] - width / 2, pf_pct, width,
+                      color=C_WARN, alpha=0.85, label="Prefetch First")
+    bar1_b = ax_b.bar(x[0] + width / 2, rf_pct, width,
+                      color=C_OK, alpha=0.85, label="Restore First")
 
-    out = os.path.join(output_dir, "m1_h2d_traffic.pdf")
+    # Group 2: Traffic volume (GB) — use twin axis
+    ax_b2 = ax_b.twinx()
+    bar2_a = ax_b2.bar(x[1] - width / 2, restore_gb, width,
+                       color=C_RESTORE, alpha=0.85)
+    bar2_b = ax_b2.bar(x[1] + width / 2, prefetch_gb, width,
+                       color=C_PREFETCH, alpha=0.85)
+
+    # Labels on bars
+    ax_b.text(x[0] - width / 2, pf_pct + 1.5, f"{pf_pct:.0f}%",
+              ha="center", va="bottom", fontsize=10, fontweight="bold", color=C_WARN)
+    ax_b.text(x[0] + width / 2, rf_pct + 1.5, f"{rf_pct:.0f}%",
+              ha="center", va="bottom", fontsize=10, fontweight="bold", color=C_OK)
+    ax_b2.text(x[1] - width / 2, restore_gb + 1, f"{restore_gb:.0f}",
+               ha="center", va="bottom", fontsize=10, fontweight="bold", color=C_RESTORE)
+    ax_b2.text(x[1] + width / 2, prefetch_gb + 1, f"{prefetch_gb:.0f}",
+               ha="center", va="bottom", fontsize=10, fontweight="bold", color=C_PREFETCH)
+
+    ax_b.set_xticks(x)
+    ax_b.set_xticklabels(["Scheduling\nOrder (%)", "Traffic\nVolume (GB)"], fontsize=10)
+    ax_b.set_ylabel("Percentage (%)")
+    ax_b2.set_ylabel("Data Volume (GB)")
+    ax_b.set_ylim(0, 80)
+    ax_b2.set_ylim(0, 90)
+    ax_b.set_title("(b) Scheduling Disorder Statistics")
+    ax_b.grid(True, alpha=0.2, axis="y")
+
+    # Combined legend
+    legend_elements = [
+        mpatches.Patch(color=C_WARN, alpha=0.85, label="Prefetch first (inversion)"),
+        mpatches.Patch(color=C_OK, alpha=0.85, label="Restore first (correct)"),
+        mpatches.Patch(color=C_RESTORE, alpha=0.85, label="Restore volume"),
+        mpatches.Patch(color=C_PREFETCH, alpha=0.85, label="Prefetch volume"),
+    ]
+    ax_b.legend(handles=legend_elements, fontsize=7.5, loc="upper right",
+                framealpha=0.9, edgecolor="gray")
+
+    # Annotation
+    ax_b.text(0.5, 0.02,
+              "Equal traffic, no priority differentiation",
+              transform=ax_b.transAxes, ha="center", va="bottom",
+              fontsize=9, style="italic", color="#555")
+
+    out = os.path.join(output_dir, "fig1_pcie_contention.pdf")
     fig.savefig(out)
     plt.close(fig)
-    print(f"[M1] Saved: {out}")
-
-    # Print statistics
-    print("[M1] H2D Traffic Summary:")
-    for g in groups_sorted:
-        d = groups_data[g]
-        total = len(d["restore"]) + len(d["prefetch"])
-        total_gb = (d["restore_bytes"] + d["prefetch_bytes"]) / 1e9
-        rl = d["restore_lats"]
-        print(f"  {g}: Restore={len(d['restore'])}, Prefetch={len(d['prefetch'])}, "
-              f"Total H2D={total}, Volume={total_gb:.1f}GB" +
-              (f", Restore P50={np.median(rl):.2f}ms, P95={np.percentile(rl, 95):.2f}ms"
-               if len(rl) > 0 else ""))
+    print(f"[Fig1] Saved: {out}")
 
 
 # ============================================================
-# M2: PCIe Transfer Timeline (Gantt)
+# Figure 2: TTFT Long-Tail CDF
 # ============================================================
-TRACK_ORDER = {
-    # gpu_id -> direction -> track_index
-    (0, "H2D"): 0, (0, "D2H"): 1, (0, "P2P"): 2,
-    (1, "H2D"): 3, (1, "D2H"): 4, (1, "P2P"): 5,
-}
-TRACK_LABELS = [
-    "GPU0 H2D", "GPU0 D2H", "GPU0 P2P",
-    "GPU1 H2D", "GPU1 D2H", "GPU1 P2P",
-]
+def figure_2(ttft_path: str, output_dir: str):
+    """Fig2: TTFT CDF — Turn 1 (cold start) vs Turn 2-5 (with Prefetch cache).
 
-
-def _infer_direction(e: dict) -> str:
-    if "direction" in e:
-        return e["direction"]
-    op = e.get("op_type", "")
-    if op in ("Prefetch", "Restore"):
-        return "H2D"
-    if op == "Evict":
-        return "D2H"
-    return "P2P"
-
-
-def _find_active_window(events: list[dict], duration_ms: float = 500.0) -> tuple[float, float]:
-    """Find a window with the most H2D activity on GPU1 (the PP contention hotspot).
-
-    Prioritizes windows where H2D events on GPU1 co-occur with PP_Recv,
-    since that's where the scheduling story is most visible.
+    The counter-intuitive finding: cached requests are SLOWER than cold starts.
     """
-    # Score H2D events on GPU1 higher (contention hotspot)
-    gpu1_h2d = [e for e in events
-                if e["op_type"] in ("Prefetch", "Restore") and e.get("gpu_id") == 1]
-    all_h2d = [e for e in events if e["op_type"] in ("Prefetch", "Restore")]
-    target = gpu1_h2d if len(gpu1_h2d) >= 3 else all_h2d
-
-    if not target:
-        starts = [e["start_ms"] for e in events if "start_ms" in e]
-        if not starts:
-            return 0, duration_ms
-        return min(starts), min(starts) + duration_ms
-
-    sorted_starts = sorted(e["start_ms"] for e in target)
-    best_count = 0
-    best_start = sorted_starts[0]
-    j = 0
-    for i, s in enumerate(sorted_starts):
-        while j < len(sorted_starts) and sorted_starts[j] < s + duration_ms:
-            j += 1
-        count = j - i
-        if count > best_count:
-            best_count = count
-            best_start = s
-
-    # Align to start slightly before the first H2D in the window
-    return best_start - 10, best_start + duration_ms - 10
-
-
-def _detect_idle_windows(events: list[dict], t_start_ms: float, t_end_ms: float,
-                         target_gpu: int = 1) -> list[tuple[float, float]]:
-    """Detect IDLE windows: gaps between consecutive PP_P2P_Recv events on target GPU.
-
-    PP_Recv duration includes NCCL blocking wait. The gap between consecutive
-    PP_Recv events is the IDLE window where no PP communication occupies the
-    PCIe link — ideal for scheduling H2D transfers.
-    """
-    pp_recvs = sorted(
-        [e for e in events
-         if e["op_type"] == "PP_P2P_Recv" and e.get("gpu_id") == target_gpu],
-        key=lambda x: x["start_ms"],
-    )
-    if len(pp_recvs) < 2:
-        return []
-
-    idle_windows = []
-    for i in range(len(pp_recvs) - 1):
-        gap_start = pp_recvs[i]["start_ms"] + pp_recvs[i]["duration_ms"]
-        gap_end = pp_recvs[i + 1]["start_ms"]
-        gap_ms = gap_end - gap_start
-        # IDLE windows: gap between PP_Recv completions
-        if gap_ms > 1.0:
-            if gap_start < t_end_ms and gap_end > t_start_ms:
-                idle_windows.append((
-                    max(gap_start, t_start_ms) - t_start_ms,
-                    min(gap_end, t_end_ms) - t_start_ms,
-                ))
-    return idle_windows
-
-
-def figure_m2(baseline_trace_path: str, sched_trace_path: str | None,
-              output_dir: str, window_start: float | None = None,
-              window_duration: float = 200.0):
-    """M2: PCIe transfer timeline showing IDLE windows and contention."""
-    baseline = load_events(baseline_trace_path)
-    has_sched = sched_trace_path is not None
-    sched = load_events(sched_trace_path) if has_sched else None
-
-    n_panels = 2 if has_sched else 1
-    fig, axes = plt.subplots(n_panels, 1, figsize=(14, 3.5 * n_panels),
-                             squeeze=False)
-
-    panels = [("Baseline (no scheduling)", baseline)]
-    if has_sched:
-        panels.append(("With PCIe Scheduling", sched))
-
-    for idx, (title, evts) in enumerate(panels):
-        ax = axes[idx, 0]
-
-        # Each panel gets its own window (traces may have different absolute times)
-        if window_start is not None and idx == 0:
-            t_start = window_start
-            t_end = window_start + window_duration
-        else:
-            t_start, t_end = _find_active_window(evts, window_duration)
-        print(f"[M2] Panel '{title}' window: {t_start:.1f} - {t_end:.1f} ms")
-
-        # Draw IDLE windows as green bands
-        idle_windows = _detect_idle_windows(evts, t_start, t_end)
-        print(f"[M2]   IDLE windows: {len(idle_windows)}")
-        for iw_start, iw_end in idle_windows:
-            ax.axvspan(iw_start, iw_end, alpha=0.08, color="#2ecc71",
-                       zorder=0)
-
-        # Draw events
-        for e in evts:
-            start_ms = e.get("start_ms", e["start_us"] / 1000.0)
-            dur = e.get("duration_ms", (e["end_us"] - e["start_us"]) / 1000.0)
-            rel_start = start_ms - t_start
-            if rel_start + dur < 0 or rel_start > (t_end - t_start):
-                continue
-
-            gpu = e.get("gpu_id", 0)
-            if gpu > 1:
-                continue
-            direction = _infer_direction(e)
-            track_key = (gpu, direction)
-            y = TRACK_ORDER.get(track_key)
-            if y is None:
-                continue
-            color = COLOR_MAP.get(e["op_type"], "#bdc3c7")
-            ax.barh(y, dur, left=rel_start, height=0.7, color=color,
-                    alpha=0.85, edgecolor="none", zorder=2)
-
-        ax.set_yticks(range(len(TRACK_LABELS)))
-        ax.set_yticklabels(TRACK_LABELS, fontsize=8)
-        ax.set_title(title, fontsize=11, fontweight="bold")
-        ax.set_xlim(0, t_end - t_start)
-        ax.invert_yaxis()
-        ax.grid(True, alpha=0.15, axis="x")
-
-    axes[-1, 0].set_xlabel("Relative Time (ms)")
-
-    # Legend
-    legend_items = ["Prefetch", "Restore", "Evict", "PP_P2P_Recv", "PP_P2P_Send"]
-    patches = [mpatches.Patch(color=COLOR_MAP[k], label=k) for k in legend_items
-               if k in COLOR_MAP]
-    patches.append(mpatches.Patch(color="#2ecc71", alpha=0.15, label="IDLE Window"))
-    fig.legend(handles=patches, loc="upper right", fontsize=8, ncol=3,
-               bbox_to_anchor=(0.98, 0.98))
-
-    fig.suptitle("PCIe Transfer Timeline with PP Communication Phases",
-                 fontsize=13, y=1.02)
-    fig.tight_layout()
-
-    out = os.path.join(output_dir, "m2_pcie_timeline.pdf")
-    fig.savefig(out)
-    plt.close(fig)
-    print(f"[M2] Saved: {out}")
-    # IDLE window stats already printed per panel above
-
-
-# ============================================================
-# M3: TTFT CDF (multi-group comparison)
-# ============================================================
-def figure_m3(ttft_groups: dict[str, np.ndarray], output_dir: str):
-    """M3: TTFT CDF comparing multiple experimental groups."""
-    if not ttft_groups:
-        print("M3: No TTFT data provided, skipping.")
+    records = load_ttft(ttft_path)
+    if not records:
+        print("[Fig2] No TTFT data, skipping.")
         return
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
+    # Split by turn
+    turn1 = np.array([r["ttft_ms"] / 1000.0 for r in records if r.get("turn", 1) == 1])
+    turn2_5 = np.array([r["ttft_ms"] / 1000.0 for r in records
+                        if 2 <= r.get("turn", 1) <= 5])
 
-    # --- Panel (a): Full CDF ---
-    for group_name in sorted(ttft_groups.keys()):
-        data = ttft_groups[group_name]
-        if len(data) == 0:
-            continue
-        sorted_d = np.sort(data)
-        cdf = np.arange(1, len(sorted_d) + 1) / len(sorted_d)
-        color = GROUP_COLORS.get(group_name, "#333333")
-        label = GROUP_LABELS.get(group_name, group_name)
-        ax1.plot(sorted_d, cdf, label=f"{label} (n={len(data)})",
-                 color=color, linewidth=1.8)
+    fig, ax = plt.subplots(1, 1, figsize=(7, 4.5), constrained_layout=True)
 
-    ax1.set_xlabel("TTFT (ms)")
-    ax1.set_ylabel("CDF")
-    ax1.set_title("(a) TTFT Distribution (all requests)")
-    ax1.legend(loc="lower right", fontsize=8)
-    ax1.grid(True, alpha=0.3)
-    ax1.set_ylim(0, 1.05)
+    # CDF: Turn 1 (cold start) — black dashed
+    if len(turn1) > 0:
+        sorted_t1 = np.sort(turn1)
+        cdf_t1 = np.arange(1, len(sorted_t1) + 1) / len(sorted_t1)
+        ax.plot(sorted_t1, cdf_t1, color="black", linestyle="--", linewidth=2,
+                label=f"Turn 1 — Cold Start (n={len(turn1)})", zorder=4)
 
-    # --- Panel (b): Bar chart of percentiles ---
-    groups_sorted = sorted(ttft_groups.keys())
-    x = np.arange(len(groups_sorted))
-    width = 0.2
+    # CDF: Turn 2-5 (cached) — red solid
+    if len(turn2_5) > 0:
+        sorted_t25 = np.sort(turn2_5)
+        cdf_t25 = np.arange(1, len(sorted_t25) + 1) / len(sorted_t25)
+        ax.plot(sorted_t25, cdf_t25, color=C_WARN, linestyle="-", linewidth=2.5,
+                label=f"Turn 2-5 — With Prefetch Cache (n={len(turn2_5)})", zorder=3)
 
-    percentiles = {"P50": 50, "P95": 95, "P99": 99}
-    pct_colors = {"P50": "#3498db", "P95": "#e67e22", "P99": "#e74c3c"}
+    # P50 horizontal line
+    ax.axhline(y=0.5, color="gray", linestyle="-.", alpha=0.4, linewidth=0.8)
+    ax.text(0.5, 0.51, "P50", fontsize=9, color="gray", alpha=0.6)
 
-    for i, (pct_name, pct_val) in enumerate(percentiles.items()):
-        vals = []
-        for g in groups_sorted:
-            data = ttft_groups[g]
-            vals.append(np.percentile(data, pct_val) if len(data) > 0 else 0)
-        bars = ax2.bar(x + (i - 1) * width, vals, width, label=pct_name,
-                       color=pct_colors[pct_name], alpha=0.8)
-        for bar, v in zip(bars, vals):
-            if v > 0:
-                ax2.text(bar.get_x() + bar.get_width() / 2, v,
-                         f"{v:.0f}", ha="center", va="bottom", fontsize=6)
+    # Threshold vertical lines at 10s and 20s
+    for thresh_s in [10, 20]:
+        ax.axvline(x=thresh_s, color="gray", linestyle="--", alpha=0.4, linewidth=0.8)
 
-    ax2.set_xticks(x)
-    labels_for_bar = [GROUP_LABELS.get(g, g).replace(" ", "\n") for g in groups_sorted]
-    ax2.set_xticklabels(labels_for_bar, fontsize=7)
-    ax2.set_ylabel("TTFT (ms)")
-    ax2.set_title("(b) TTFT Percentiles")
-    ax2.legend(fontsize=8)
-    ax2.grid(True, alpha=0.3, axis="y")
+    # Annotate Turn 2-5 stats at thresholds
+    if len(turn2_5) > 0:
+        pct_gt10 = np.sum(turn2_5 > 10) / len(turn2_5) * 100
+        pct_gt20 = np.sum(turn2_5 > 20) / len(turn2_5) * 100
+        # y position on CDF at threshold
+        y_at_10 = np.searchsorted(sorted_t25, 10) / len(sorted_t25)
+        y_at_20 = np.searchsorted(sorted_t25, 20) / len(sorted_t25)
 
-    fig.suptitle("Time To First Token Distribution", fontsize=13, y=1.02)
-    fig.tight_layout()
+        ax.annotate(f"{pct_gt10:.1f}% > 10s",
+                    xy=(10, y_at_10), xytext=(14, y_at_10 - 0.12),
+                    fontsize=11, fontweight="bold", color=C_WARN,
+                    arrowprops=dict(arrowstyle="->", color=C_WARN, lw=1.5),
+                    zorder=5)
+        ax.annotate(f"{pct_gt20:.1f}% > 20s",
+                    xy=(20, y_at_20), xytext=(23, y_at_20 - 0.10),
+                    fontsize=11, fontweight="bold", color=C_WARN,
+                    arrowprops=dict(arrowstyle="->", color=C_WARN, lw=1.5),
+                    zorder=5)
 
-    out = os.path.join(output_dir, "m3_ttft_cdf.pdf")
+    # "Counter-intuitive" annotation — highlight that red line is RIGHT of black line
+    if len(turn1) > 0 and len(turn2_5) > 0:
+        # Place annotation between the two CDF curves near P50
+        t1_p50 = np.median(turn1)
+        t25_p50 = np.median(turn2_5)
+        mid_x = (t1_p50 + t25_p50) / 2
+        ax.annotate("Cached requests\nare SLOWER than\ncold starts",
+                    xy=(mid_x, 0.5), xytext=(mid_x + 6, 0.35),
+                    fontsize=10, fontweight="bold", color="#333",
+                    ha="center",
+                    arrowprops=dict(arrowstyle="->", color="#666", lw=1.5,
+                                    connectionstyle="arc3,rad=0.2"),
+                    bbox=dict(boxstyle="round,pad=0.4", facecolor="#FFF3CD",
+                              edgecolor="#F0C36D", alpha=0.95),
+                    zorder=5)
+
+    ax.set_xlabel("TTFT (seconds)")
+    ax.set_ylabel("CDF")
+    ax.set_xlim(0, 35)
+    ax.set_ylim(0, 1.05)
+    ax.legend(fontsize=10, loc="lower right", framealpha=0.9, edgecolor="gray")
+    ax.grid(True, alpha=0.25)
+
+    out = os.path.join(output_dir, "fig2_ttft_longtail.pdf")
     fig.savefig(out)
     plt.close(fig)
-    print(f"[M3] Saved: {out}")
+    print(f"[Fig2] Saved: {out}")
 
-    # Print summary
-    print("[M3] TTFT Summary:")
-    for g in groups_sorted:
-        data = ttft_groups[g]
-        if len(data) == 0:
-            continue
-        print(f"  {g}: n={len(data)}, mean={np.mean(data):.0f}ms, "
-              f"P50={np.median(data):.0f}ms, P95={np.percentile(data, 95):.0f}ms, "
-              f"P99={np.percentile(data, 99):.0f}ms")
+    # Print stats
+    if len(turn1) > 0:
+        print(f"[Fig2] Turn 1:   n={len(turn1)}, P50={np.median(turn1):.1f}s, "
+              f"mean={np.mean(turn1):.1f}s")
+    if len(turn2_5) > 0:
+        print(f"[Fig2] Turn 2-5: n={len(turn2_5)}, P50={np.median(turn2_5):.1f}s, "
+              f"mean={np.mean(turn2_5):.1f}s, "
+              f">{10}s: {np.sum(turn2_5>10)/len(turn2_5)*100:.1f}%, "
+              f">{20}s: {np.sum(turn2_5>20)/len(turn2_5)*100:.1f}%")
 
 
 # ============================================================
-# M4: Bandwidth Utilization vs. H2D Latency
+# Figure 3: PCIe Utilization Heatmap
 # ============================================================
-def figure_m4(trace_path: str, output_dir: str, slice_ms: float = 50.0):
-    """M4: PCIe bandwidth utilization is low, but H2D latency variance is high.
+def figure_3(trace_path: str, output_dir: str, bin_ms: float = 200.0):
+    """Fig3: Full-trace PCIe utilization heatmap.
 
-    Shows that the bottleneck is scheduling, not bandwidth.
-    Computes time-slice based BW utilization and correlates with H2D latency.
-
-    Uses only real data transfers (H2D, D2H) for BW calculation.
-    PP_P2P_Send is ~0.06ms (async NCCL call), so we estimate PP's actual
-    PCIe transfer from the PP_P2P_Recv's associated data size divided by
-    a reasonable bandwidth (~12 GB/s observed).
+    Shows traffic density over the entire experiment, color-coded by type.
+    Each row is a transfer type, X is time, color intensity is bandwidth.
     """
     events = load_events(trace_path)
 
-    h2d_events = [e for e in events if e["op_type"] in ("Prefetch", "Restore")]
-    d2h_events = [e for e in events if e["op_type"] == "Evict"]
-    if not h2d_events:
-        print("M4: No H2D events, skipping.")
-        return
+    # Filter to GPU1 (the contention hotspot in PP=2)
+    gpu1 = [e for e in events if e.get("gpu_id") == 1]
+    if not gpu1:
+        gpu1 = events  # fallback
 
-    # --- Compute global BW utilization using time slices ---
-    # Only count actual data movement: H2D (Prefetch/Restore), D2H (Evict)
-    # PP P2P uses the same link but PP_Send duration is bogus (0.06ms),
-    # so we skip it for BW calculation and rely on overlap classification instead
-    data_transfers = h2d_events + d2h_events
-
-    all_start = min(e["start_us"] for e in data_transfers)
-    all_end = max(e["end_us"] for e in data_transfers)
-    total_dur_s = (all_end - all_start) / 1e6
-
-    total_h2d_bytes = sum(e.get("wire_bytes", e["size_bytes"]) for e in h2d_events)
-    total_d2h_bytes = sum(e.get("wire_bytes", e["size_bytes"]) for e in d2h_events)
-    total_h2d_active_ms = sum(e["duration_ms"] for e in h2d_events)
-    total_d2h_active_ms = sum(e["duration_ms"] for e in d2h_events)
-
-    # PCIe Gen4 x16: ~25.6 GB/s per direction (A100 uses PCIe Gen4)
-    PCIE_PEAK_GBPS = 25.6
-
-    # Average BW utilization = total_bytes / (total_time * peak_bw)
-    avg_bw_util = ((total_h2d_bytes + total_d2h_bytes) / 1e9) / (total_dur_s * PCIE_PEAK_GBPS) * 100
-
-    # Per-H2D: classify by PP overlap (reuse M1 logic)
-    pp_recv_by_gpu = defaultdict(list)
-    for e in events:
-        if e["op_type"] == "PP_P2P_Recv":
-            pp_recv_by_gpu[e["gpu_id"]].append(e)
-    for gpu in pp_recv_by_gpu:
-        pp_recv_by_gpu[gpu].sort(key=lambda x: x["start_us"])
-
-    overlapped_lats = []
-    non_overlapped_lats = []
-    all_lats = []
-    all_bws = []  # per-transfer achieved bandwidth
-
-    for h in h2d_events:
-        h_start, h_end = h["start_us"], h["end_us"]
-        h_dur_us = h_end - h_start
-        if h_dur_us <= 0:
-            continue
-
-        gpu = h.get("gpu_id", 0)
-        pp_events = pp_recv_by_gpu.get(gpu, [])
-        has_pp = any(
-            p["end_us"] > h_start and p["start_us"] < h_end
-            for p in pp_events
-        )
-
-        lat = h["duration_ms"]
-        bw = h.get("bandwidth_gbps", 0)
-        all_lats.append(lat)
-        all_bws.append(bw)
-
-        if has_pp:
-            overlapped_lats.append(lat)
-        else:
-            non_overlapped_lats.append(lat)
-
-    all_lats = np.array(all_lats)
-    all_bws = np.array(all_bws)
-    overlapped_lats = np.array(overlapped_lats)
-    non_overlapped_lats = np.array(non_overlapped_lats)
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
-
-    # --- Panel (a): Per-transfer achieved BW vs latency ---
-    mask_ov = np.zeros(len(all_lats), dtype=bool)
-    idx = 0
-    for h in h2d_events:
-        if h["end_us"] - h["start_us"] <= 0:
-            continue
-        gpu = h.get("gpu_id", 0)
-        pp_events = pp_recv_by_gpu.get(gpu, [])
-        has_pp = any(
-            p["end_us"] > h["start_us"] and p["start_us"] < h["end_us"]
-            for p in pp_events
-        )
-        mask_ov[idx] = has_pp
-        idx += 1
-
-    mask_no_ov = ~mask_ov
-
-    if np.sum(mask_no_ov) > 0:
-        ax1.scatter(all_bws[mask_no_ov], all_lats[mask_no_ov],
-                    alpha=0.5, s=20, color="#2ecc71", label="No PP overlap",
-                    edgecolors="none")
-    if np.sum(mask_ov) > 0:
-        ax1.scatter(all_bws[mask_ov], all_lats[mask_ov],
-                    alpha=0.5, s=20, color="#e74c3c", label="With PP overlap",
-                    edgecolors="none")
-
-    ax1.set_xlabel("Achieved Bandwidth per Transfer (GB/s)")
-    ax1.set_ylabel("H2D Transfer Latency (ms)")
-    ax1.set_title("(a) Per-Transfer BW vs. Latency")
-    ax1.legend(loc="upper right", fontsize=8)
-    ax1.grid(True, alpha=0.3)
-
-    # --- Panel (b): Key statistics bar chart ---
-    categories = ["Overall\nBW Util", "H2D Active\nTime Ratio", "Latency\nCV (no PP)", "Latency\nCV (w/ PP)"]
-    values = [
-        avg_bw_util,
-        total_h2d_active_ms / (total_dur_s * 1000) * 100,  # H2D duty cycle
-        (np.std(non_overlapped_lats) / np.mean(non_overlapped_lats) * 100
-         if len(non_overlapped_lats) > 0 and np.mean(non_overlapped_lats) > 0 else 0),
-        (np.std(overlapped_lats) / np.mean(overlapped_lats) * 100
-         if len(overlapped_lats) > 0 and np.mean(overlapped_lats) > 0 else 0),
+    # Define transfer categories and their colormaps
+    categories = [
+        ("Restore", "Reds", [e for e in gpu1 if e["op_type"] == "Restore"]),
+        ("Prefetch", "Blues", [e for e in gpu1 if e["op_type"] == "Prefetch"]),
+        ("PP_Recv", "Greys", [e for e in gpu1 if e["op_type"] == "PP_P2P_Recv"]),
+        ("Evict", "Greens", [e for e in gpu1 if e["op_type"] == "Evict"]),
     ]
-    colors_bar = ["#3498db", "#3498db", "#e74c3c", "#e74c3c"]
 
-    x = np.arange(len(categories))
-    bars = ax2.bar(x, values, 0.5, color=colors_bar, alpha=0.7)
-    for bar, v in zip(bars, values):
-        ax2.text(bar.get_x() + bar.get_width() / 2, v + 0.5,
-                 f"{v:.1f}%", ha="center", va="bottom", fontsize=8, fontweight="bold")
+    # Time range
+    all_starts = [e["start_us"] for e in gpu1]
+    all_ends = [e["end_us"] for e in gpu1]
+    if not all_starts:
+        print("[Fig3] No events, skipping.")
+        return
+    t_min = min(all_starts)
+    t_max = max(all_ends)
+    total_dur_ms = (t_max - t_min) / 1000.0
 
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(categories, fontsize=8)
-    ax2.set_ylabel("Percentage (%)")
-    ax2.set_title("(b) Low Utilization, High Variance")
-    ax2.grid(True, alpha=0.3, axis="y")
+    # Create time bins
+    n_bins = int(np.ceil(total_dur_ms / bin_ms))
+    bin_edges_ms = np.arange(n_bins + 1) * bin_ms
 
-    fig.suptitle("PCIe Bandwidth Is Not the Bottleneck — Scheduling Is",
-                 fontsize=13, y=1.02)
-    fig.tight_layout()
+    # Compute bandwidth per bin for each category
+    heatmap_data = {}
+    for cat_name, cmap_name, cat_events in categories:
+        bw_per_bin = np.zeros(n_bins)
+        for e in cat_events:
+            rel_start_ms = (e["start_us"] - t_min) / 1000.0
+            rel_end_ms = (e["end_us"] - t_min) / 1000.0
+            size_gb = e.get("wire_bytes", e.get("size_bytes", 0)) / 1e9
 
-    out = os.path.join(output_dir, "m4_bw_vs_latency.pdf")
+            # Distribute bandwidth across bins
+            bin_start = max(0, int(rel_start_ms / bin_ms))
+            bin_end = min(n_bins - 1, int(rel_end_ms / bin_ms))
+            dur_ms = rel_end_ms - rel_start_ms
+            if dur_ms <= 0:
+                continue
+            bw_gbps = size_gb / (dur_ms / 1000.0)  # GB/s
+
+            for b in range(bin_start, bin_end + 1):
+                b_start = b * bin_ms
+                b_end = (b + 1) * bin_ms
+                overlap_start = max(rel_start_ms, b_start)
+                overlap_end = min(rel_end_ms, b_end)
+                if overlap_end > overlap_start:
+                    frac = (overlap_end - overlap_start) / bin_ms
+                    bw_per_bin[b] += bw_gbps * frac
+
+        heatmap_data[cat_name] = (bw_per_bin, cmap_name)
+
+    # Plot: one row per category
+    active_cats = [(name, data, cmap) for name, (data, cmap) in heatmap_data.items()
+                   if np.max(data) > 0]
+
+    fig, axes = plt.subplots(len(active_cats), 1, figsize=(14, 1.5 * len(active_cats) + 0.8),
+                             constrained_layout=True, sharex=True)
+    if len(active_cats) == 1:
+        axes = [axes]
+
+    # Convert bin times to seconds for x-axis
+    bin_centers_s = (bin_edges_ms[:-1] + bin_ms / 2) / 1000.0
+
+    for idx, (cat_name, bw_data, cmap_name) in enumerate(active_cats):
+        ax = axes[idx]
+        # Reshape to 1 row for imshow-like display
+        data_2d = bw_data.reshape(1, -1)
+
+        vmax = max(np.percentile(bw_data[bw_data > 0], 95) if np.any(bw_data > 0) else 1, 0.1)
+        im = ax.imshow(data_2d, aspect="auto", cmap=cmap_name,
+                       vmin=0, vmax=vmax,
+                       extent=[bin_centers_s[0], bin_centers_s[-1], -0.5, 0.5],
+                       interpolation="nearest")
+        ax.set_yticks([0])
+        ax.set_yticklabels([cat_name], fontsize=11)
+        ax.tick_params(axis="y", length=0)
+
+        # Colorbar
+        cbar = fig.colorbar(im, ax=ax, shrink=0.8, pad=0.02)
+        cbar.set_label("GB/s", fontsize=9)
+        cbar.ax.tick_params(labelsize=8)
+
+    axes[-1].set_xlabel("Time (seconds)")
+    axes[0].set_title("PCIe Transfer Density — GPU1 (Full Trace)")
+
+    out = os.path.join(output_dir, "fig3_pcie_heatmap.pdf")
     fig.savefig(out)
     plt.close(fig)
-    print(f"[M4] Saved: {out}")
 
-    # Print key numbers for paper
-    print(f"[M4] Key numbers:")
-    print(f"  Experiment duration: {total_dur_s:.1f}s")
-    print(f"  Total H2D: {total_h2d_bytes/1e9:.2f} GB in {total_h2d_active_ms:.0f}ms active")
-    print(f"  Total D2H: {total_d2h_bytes/1e9:.2f} GB in {total_d2h_active_ms:.0f}ms active")
-    print(f"  Average PCIe BW utilization: {avg_bw_util:.2f}%")
-    print(f"  H2D duty cycle: {total_h2d_active_ms / (total_dur_s * 1000) * 100:.2f}%")
-    print(f"  H2D latency (all): mean={np.mean(all_lats):.2f}ms, CV={np.std(all_lats)/np.mean(all_lats)*100:.1f}%")
-    if len(non_overlapped_lats) > 0:
-        print(f"  H2D latency (no PP): mean={np.mean(non_overlapped_lats):.2f}ms, "
-              f"CV={np.std(non_overlapped_lats)/np.mean(non_overlapped_lats)*100:.1f}%")
-    if len(overlapped_lats) > 0:
-        print(f"  H2D latency (w/ PP): mean={np.mean(overlapped_lats):.2f}ms, "
-              f"CV={np.std(overlapped_lats)/np.mean(overlapped_lats)*100:.1f}%")
+    print(f"[Fig3] Saved: {out}")
+    print(f"[Fig3] Trace duration: {total_dur_ms/1000:.1f}s, bins: {n_bins} x {bin_ms}ms")
+    for name, (data, _) in heatmap_data.items():
+        if np.max(data) > 0:
+            print(f"  {name}: peak={np.max(data):.1f} GB/s, "
+                  f"active bins={np.sum(data > 0)}/{n_bins}")
 
 
 # ============================================================
-# Auto-detect files in experiment directory
+# Auto-detect files
 # ============================================================
 def auto_detect_files(exp_dir: str) -> dict:
-    """Auto-detect PCIe trace and TTFT files in an experiment directory."""
     d = Path(exp_dir)
     result = {}
-
-    # PCIe traces
     for pattern, key in [
-        ("pcie_events_g0_*", "trace_g0"),
         ("pcie_events_g1_*", "trace_g1"),
-        ("pcie_events_g2_*", "trace_g2"),
-        ("pcie_events_g3_*", "trace_g3"),
     ]:
         matches = list(d.glob(pattern))
         if matches:
             result[key] = str(matches[0])
-
-    # TTFT files
     for pattern, key in [
-        ("prefetch_g0_*", "ttft_g0"),
         ("prefetch_g1_*", "ttft_g1"),
-        ("prefetch_g2_*", "ttft_g2"),
-        ("prefetch_g3_*", "ttft_g3"),
     ]:
         matches = [m for m in d.glob(pattern) if m.suffix == ".jsonl"]
         if matches:
             result[key] = str(matches[0])
-
     return result
 
 
@@ -710,26 +582,24 @@ def auto_detect_files(exp_dir: str) -> dict:
 # ============================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate motivation section figures for PCIe scheduling paper")
-    parser.add_argument("--exp-dir", help="Experiment result directory (auto-detect files)")
-    parser.add_argument("--baseline-trace", help="PCIe trace JSON for baseline (G1)")
-    parser.add_argument("--sched-trace", help="PCIe trace JSON for scheduled (G3)")
-    parser.add_argument("--ttft-files", nargs="*",
-                        help="'GroupName:path.jsonl' pairs for TTFT analysis")
-    parser.add_argument("--figures", nargs="*", default=["m1", "m2", "m3", "m4"],
-                        help="Which figures to generate (default: all)")
+        description="Generate motivation figures (publication quality)")
+    parser.add_argument("--exp-dir",
+                        help="Experiment result directory (auto-detect G1 files)")
+    parser.add_argument("--g1-trace",
+                        help="G1 PCIe trace JSON (override auto-detect)")
+    parser.add_argument("--g1-ttft",
+                        help="G1 TTFT JSONL (override auto-detect)")
+    parser.add_argument("--figures", nargs="*", default=["fig1", "fig2", "fig3"],
+                        help="Which figures to generate (default: fig1 fig2 fig3)")
     parser.add_argument("--output", default="figures/motivation/",
                         help="Output directory")
-    parser.add_argument("--window-start", type=float, default=None,
-                        help="M2 timeline window start (ms, absolute)")
-    parser.add_argument("--window-duration", type=float, default=500.0,
-                        help="M2 timeline window duration (ms, default=500)")
+    parser.add_argument("--heatmap-bin", type=float, default=200.0,
+                        help="Heatmap time bin size in ms (default: 200)")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
     figures = set(f.lower() for f in args.figures)
 
-    # Auto-detect files from exp-dir
     files = {}
     if args.exp_dir:
         files = auto_detect_files(args.exp_dir)
@@ -737,73 +607,33 @@ def main():
         for k, v in sorted(files.items()):
             print(f"  {k}: {Path(v).name}")
 
-    # Resolve trace paths
-    baseline_trace = args.baseline_trace or files.get("trace_g1")
-    sched_trace = args.sched_trace or files.get("trace_g3")
+    g1_trace = args.g1_trace or files.get("trace_g1")
+    g1_ttft = args.g1_ttft or files.get("ttft_g1")
 
-    # Resolve TTFT paths
-    ttft_groups = {}
-    if args.ttft_files:
-        for item in args.ttft_files:
-            if ":" not in item:
-                continue
-            label, path = item.split(":", 1)
-            data = load_ttft(path)
-            if len(data) > 0:
-                ttft_groups[label] = data
-    else:
-        for group_key, file_key in [("G0", "ttft_g0"), ("G1", "ttft_g1"),
-                                     ("G2", "ttft_g2"), ("G3", "ttft_g3")]:
-            if file_key in files:
-                data = load_ttft(files[file_key])
-                if len(data) > 0:
-                    ttft_groups[group_key] = data
+    if not g1_trace:
+        print("ERROR: No G1 trace found. Use --exp-dir or --g1-trace.", file=sys.stderr)
+        sys.exit(1)
 
-    # Generate figures
-    if "m1" in figures:
-        # M1 needs traces from multiple groups for comparison
-        m1_traces = {}
-        for gkey, fkey in [("G0", "trace_g0"), ("G1", "trace_g1"),
-                           ("G2", "trace_g2"), ("G3", "trace_g3")]:
-            if fkey in files:
-                m1_traces[gkey] = files[fkey]
-        if m1_traces:
+    if "fig1" in figures:
+        print("\n" + "=" * 60)
+        print("Generating Fig1: PCIe Contention & Priority Inversion")
+        print("=" * 60)
+        figure_1(g1_trace, args.output)
+
+    if "fig2" in figures:
+        if g1_ttft:
             print("\n" + "=" * 60)
-            print("Generating M1: H2D Traffic Characterization")
+            print("Generating Fig2: TTFT Long-Tail CDF")
             print("=" * 60)
-            figure_m1(m1_traces, args.output)
+            figure_2(g1_ttft, args.output)
         else:
-            print("M1: No trace files found, skipping.")
+            print("Fig2: No G1 TTFT file found, skipping.")
 
-    if "m2" in figures:
-        if baseline_trace:
-            print("\n" + "=" * 60)
-            print("Generating M2: PCIe Timeline")
-            print("=" * 60)
-            figure_m2(baseline_trace, sched_trace, args.output,
-                      window_start=args.window_start,
-                      window_duration=args.window_duration)
-        else:
-            print("M2: No trace files found, skipping.")
-
-    if "m3" in figures:
-        if ttft_groups:
-            print("\n" + "=" * 60)
-            print("Generating M3: TTFT CDF")
-            print("=" * 60)
-            figure_m3(ttft_groups, args.output)
-        else:
-            print("M3: No TTFT data found, skipping.")
-
-    if "m4" in figures:
-        trace_for_m4 = baseline_trace
-        if trace_for_m4:
-            print("\n" + "=" * 60)
-            print("Generating M4: BW Utilization vs. Latency")
-            print("=" * 60)
-            figure_m4(trace_for_m4, args.output)
-        else:
-            print("M4: No trace found, skipping.")
+    if "fig3" in figures:
+        print("\n" + "=" * 60)
+        print("Generating Fig3: PCIe Utilization Heatmap")
+        print("=" * 60)
+        figure_3(g1_trace, args.output, bin_ms=args.heatmap_bin)
 
 
 if __name__ == "__main__":

@@ -133,10 +133,12 @@ fi
 
 if [ "$PCIE_SCHEDULER" -eq 1 ]; then
   CMD_ARGS+=(--enable-pcie-scheduling)
-  CMD_ARGS+=(--max-concurrent-h2d 2)
-  CMD_ARGS+=(--prefetch-block-threshold 150)
-  CMD_ARGS+=(--max-queue-wait-ms 30)
+  CMD_ARGS+=(--max-concurrent-h2d "${PCIE_MAX_CONCURRENT_H2D:-2}")
+  CMD_ARGS+=(--prefetch-block-threshold "${PCIE_PREFETCH_BLOCK_THRESHOLD:-150}")
+  CMD_ARGS+=(--max-queue-wait-ms "${PCIE_MAX_QUEUE_WAIT_MS:-30}")
   [[ "$NO_PP_PHASE_AWARE" -eq 1 ]] && CMD_ARGS+=(--no-enable-pp-phase-aware) && echo "Ablation: PP-phase-aware disabled"
+  [[ "${PCIE_NO_PRIORITY_QUEUE:-0}" == "1" ]] && CMD_ARGS+=(--no-priority-queue) && echo "Ablation: priority queue disabled (FIFO mode)"
+  [[ "${PCIE_NO_EVICT_FIRST:-0}" == "1" ]] && CMD_ARGS+=(--no-evict-first) && echo "Ablation: evict-first disabled (H2D before D2H)"
   echo "PCIe Scheduling parameters added to vLLM args"
 fi
 
