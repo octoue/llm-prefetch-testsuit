@@ -428,6 +428,15 @@ fi
 
 print_phase "Generating mechanism ablation report..."
 
+# Build suffix list based on RUN_GROUPS
+REPORT_SUFFIXES=()
+should_run_group full   && REPORT_SUFFIXES+=(full_sched)
+should_run_group no-pq  && REPORT_SUFFIXES+=(no_pq)
+should_run_group no-ef  && REPORT_SUFFIXES+=(no_ef)
+should_run_group no-cc  && REPORT_SUFFIXES+=(no_cc)
+should_run_group g1     && REPORT_SUFFIXES+=(g1_prefetch_only)
+should_run_group g0     && REPORT_SUFFIXES+=(g0_no_prefetch)
+
 ABLATION_MD="$RESULTS_DIR/mechanism_ablation_report.md"
 {
     echo "# Mechanism Ablation Report"
@@ -439,19 +448,19 @@ ABLATION_MD="$RESULTS_DIR/mechanism_ablation_report.md"
     echo ""
     echo "| Group | Scheduler | Priority | CC (h2d) | Evict-first | Output |"
     echo "|-------|:---------:|:--------:|:--------:|:-----------:|--------|"
-    echo "| full | ON | heap | 2 | yes | prefetch_full_sched.jsonl |"
-    echo "| no-pq | ON | FIFO | 2 | yes | prefetch_no_pq.jsonl |"
-    echo "| no-ef | ON | heap | 2 | no | prefetch_no_ef.jsonl |"
-    echo "| no-cc | ON | heap | 999 | yes | prefetch_no_cc.jsonl |"
-    echo "| g1 | OFF | - | - | - | prefetch_g1_prefetch_only.jsonl |"
-    echo "| g0 | OFF | - | - | - | prefetch_g0_no_prefetch.jsonl |"
+    should_run_group full   && echo "| full | ON | heap | 2 | yes | prefetch_full_sched.jsonl |"
+    should_run_group no-pq  && echo "| no-pq | ON | FIFO | 2 | yes | prefetch_no_pq.jsonl |"
+    should_run_group no-ef  && echo "| no-ef | ON | heap | 2 | no | prefetch_no_ef.jsonl |"
+    should_run_group no-cc  && echo "| no-cc | ON | heap | 999 | yes | prefetch_no_cc.jsonl |"
+    should_run_group g1     && echo "| g1 | OFF | - | - | - | prefetch_g1_prefetch_only.jsonl |"
+    should_run_group g0     && echo "| g0 | OFF | - | - | - | prefetch_g0_no_prefetch.jsonl |"
     echo ""
 
     echo "## TTFT Summary"
     echo ""
     echo "| Group | Requests | Mean TTFT (ms) | P50 | P95 | P99 | Std |"
     echo "|-------|----------|----------------|-----|-----|-----|-----|"
-    for SUFFIX in full_sched no_pq no_ef no_cc g1_prefetch_only g0_no_prefetch; do
+    for SUFFIX in "${REPORT_SUFFIXES[@]}"; do
         JSONL="$RESULTS_DIR/prefetch_${SUFFIX}.jsonl"
         if [[ -f "$JSONL" ]]; then
             python3 -c "

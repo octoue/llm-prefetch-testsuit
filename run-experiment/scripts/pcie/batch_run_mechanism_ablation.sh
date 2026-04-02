@@ -46,7 +46,7 @@ shift 2>/dev/null || true
 ROUNDS=1
 GPU_BLOCKS=""
 QPS_LIST=(1.0 1.5 2.0 2.5)
-GROUPS=""
+TARGET_GROUPS=""
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -58,7 +58,7 @@ while [[ $# -gt 0 ]]; do
         --qps-list)
             IFS=' ' read -r -a QPS_LIST <<< "$2"; shift 2 ;;
         --groups)
-            GROUPS="$2"; shift 2 ;;
+            TARGET_GROUPS="$2"; shift 2 ;;
         *)
             EXTRA_ARGS+=("$1"); shift ;;
     esac
@@ -67,8 +67,8 @@ done
 if [[ -n "$GPU_BLOCKS" ]]; then
     EXTRA_ARGS+=(--gpu-blocks "$GPU_BLOCKS")
 fi
-if [[ -n "$GROUPS" ]]; then
-    EXTRA_ARGS+=(--groups "$GROUPS")
+if [[ -n "$TARGET_GROUPS" ]]; then
+    EXTRA_ARGS+=(--groups "$TARGET_GROUPS")
 fi
 
 NUM_QPS=${#QPS_LIST[@]}
@@ -82,7 +82,7 @@ echo "Dataset:    $DATASET"
 echo "QPS values: ${QPS_LIST[*]}"
 echo "Rounds:     $ROUNDS"
 echo "GPU blocks: ${GPU_BLOCKS:-<from config>}"
-echo "Groups:     ${GROUPS:-no-pq,no-ef,no-cc (default)}"
+echo "Groups:     ${TARGET_GROUPS:-no-pq,no-ef,no-cc (default)}"
 echo "Extra args: ${EXTRA_ARGS[*]}"
 echo "Total runs: $NUM_QPS QPS x $ROUNDS rounds = $TOTAL_RUNS ablation runs"
 echo "Start time: $(date)"
