@@ -162,41 +162,50 @@ class TestPrefetchStats:
         assert scheduler._prefetch_no_hits == 0
 
     def test_stats_drained_into_scheduler_stats(self):
-        """make_stats should drain counters and reset them."""
+        """make_stats should drain counters and reset them.
+
+        NOTE: update_from_output() internally calls make_stats(), which
+        drains the counters every step. So we accumulate stats across
+        steps via the returned EngineCoreOutputs instead.
+        """
         scheduler = create_scheduler(enable_prefix_caching=True)
 
-        # Generate no-hit prefetch requests with truly unique prompts.
-        # create_requests(num_requests=1, same_prompt=False) always yields
-        # [0]*num_tokens (inner i=0), so we manually set distinct tokens.
+        total_no_hits = 0
         for i in range(3):
             req = create_requests(
                 num_requests=1, num_tokens=32, max_tokens=16,
                 req_ids=[f"pf-drain-{i}"],
             )[0]
-            # Overwrite prompt to be unique and not overlap with anything.
-            req.prompt_token_ids = [100 + i] * 32
             req.prefetch_only = True
             scheduler.add_request(req)
             sched_out = scheduler.schedule()
-            scheduler.update_from_output(sched_out, _empty_model_output())
 
-        assert scheduler._prefetch_no_hits == 3, (
-            f"Expected 3 no-hits, got gpu={scheduler._prefetch_gpu_hits} "
-            f"cpu={scheduler._prefetch_cpu_hits} "
-            f"no_hit={scheduler._prefetch_no_hits} "
-            f"deferred={scheduler._prefetch_deferred}"
-        )
+            # Counter should be 1 BEFORE update_from_output drains it.
+            assert scheduler._prefetch_no_hits == 1, (
+                f"Iteration {i}: expected 1 no-hit before drain, got "
+                f"gpu={scheduler._prefetch_gpu_hits} "
+                f"cpu={scheduler._prefetch_cpu_hits} "
+                f"no_hit={scheduler._prefetch_no_hits}"
+            )
 
-        stats = scheduler.make_stats()
-        assert stats is not None
-        assert stats.prefetch_no_hits == 3
-        assert stats.prefetch_gpu_hits == 0
+            eco = scheduler.update_from_output(sched_out, _empty_model_output())
+            # update_from_output calls make_stats() which drains counters.
+            assert scheduler._prefetch_no_hits == 0
 
-        # Counters should be reset after drain.
-        assert scheduler._prefetch_no_hits == 0
+            # Collect stats from the returned outputs.
+            for client_outputs in eco.values():
+                if client_outputs.scheduler_stats is not None:
+                    total_no_hits += client_outputs.scheduler_stats.prefetch_no_hits
+
+        assert total_no_hits == 3
 
     def test_multiple_types_counted_separately(self):
-        """Mixed GPU-hit and no-hit should be counted in separate buckets."""
+        """Mixed GPU-hit and no-hit should be counted in separate buckets.
+
+        NOTE: _run_normal_request calls update_from_output, which drains
+        the counters. So we check counters only for the prefetch steps
+        that follow, without calling update_from_output in between.
+        """
         scheduler = create_scheduler(enable_prefix_caching=True)
 
         # Normal request to populate cache with prompt [0]*32.
@@ -205,6 +214,10 @@ class TestPrefetchStats:
             req_ids=["normal-0"],
         )
         _run_normal_request(scheduler, normal_reqs[0])
+        # _run_normal_request calls update_from_output, which drains all
+        # counters. Reset baseline.
+        assert scheduler._prefetch_gpu_hits == 0
+        assert scheduler._prefetch_no_hits == 0
 
         # GPU-hit prefetch (same prompt [0]*32).
         gpu_req = create_requests(
@@ -214,14 +227,21 @@ class TestPrefetchStats:
         gpu_req.prefetch_only = True
         scheduler.add_request(gpu_req)
         scheduler.schedule()
+        # Do NOT call update_from_output here — it would drain counters.
 
-        # No-hit prefetch: use a completely different token to avoid
-        # prefix overlap. [999]*32 shares no prefix with [0]*32.
-        no_hit_req = create_requests(
-            num_requests=1, num_tokens=32, max_tokens=16,
-            req_ids=["pf-nohit-0"],
-        )[0]
-        no_hit_req.prompt_token_ids = [999] * 32
+        assert scheduler._prefetch_gpu_hits == 1, (
+            f"gpu={scheduler._prefetch_gpu_hits}"
+        )
+
+        # No-hit prefetch: create_requests(num_requests=1) always produces
+        # [0]*N (inner i=0), so block hashes match the cached [0]*32.
+        # Use num_requests=2 and take index [1] to get [1]*32 → unique
+        # block hashes that won't hit the prefix cache.
+        no_hit_reqs = create_requests(
+            num_requests=2, num_tokens=32, max_tokens=16,
+            req_ids=["pf-nohit-dummy", "pf-nohit-0"],
+        )
+        no_hit_req = no_hit_reqs[1]  # prompt = [1]*32
         no_hit_req.prefetch_only = True
         scheduler.add_request(no_hit_req)
         scheduler.schedule()
