@@ -22,7 +22,16 @@
 #   --groups A,B,C,D,E   选择要运行的实验组 (default: A,B,C,D)
 # ============================================================
 
-set -eo pipefail
+set -o pipefail
+
+# 失败计数
+SKIP_COUNT=0
+FAIL_LOG=""
+record_skip() {
+    SKIP_COUNT=$((SKIP_COUNT + 1))
+    FAIL_LOG="${FAIL_LOG}\n  - $1"
+    echo "⚠️  SKIP: $1"
+}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFETCH_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -254,18 +263,22 @@ run_experiment() {
 if should_run A; then
     print_phase "[Group A] Baseline vs Prefetch (default config)"
 
-    start_vllm "A_default" \
+    if ! start_vllm "A_default" \
         --prefetch-block-threshold 150 \
-        --max-prefetch-block-ratio 0.3 \
-        || exit 1
+        --max-prefetch-block-ratio 0.3; then
+        record_skip "[Group A] vLLM 启动失败"
+        stop_vllm
+    else
+        run_experiment "A-baseline" "baseline" "$DEFAULT_QPS" "$DEFAULT_LEAD_TIME" \
+            "A_baseline_q${DEFAULT_QPS}" \
+            || record_skip "[Group A] baseline 实验失败"
 
-    run_experiment "A-baseline" "baseline" "$DEFAULT_QPS" "$DEFAULT_LEAD_TIME" \
-        "A_baseline_q${DEFAULT_QPS}"
+        run_experiment "A-prefetch" "prefetch" "$DEFAULT_QPS" "$DEFAULT_LEAD_TIME" \
+            "A_prefetch_q${DEFAULT_QPS}" \
+            || record_skip "[Group A] prefetch 实验失败"
 
-    run_experiment "A-prefetch" "prefetch" "$DEFAULT_QPS" "$DEFAULT_LEAD_TIME" \
-        "A_prefetch_q${DEFAULT_QPS}"
-
-    stop_vllm
+        stop_vllm
+    fi
 fi
 
 # ============================================================
@@ -277,13 +290,17 @@ if should_run B; then
     print_phase "[Group B] Admission Threshold Ablation"
 
     for THRESH in 0 50 100 150 200 300; do
-        start_vllm "B_thresh${THRESH}" \
+        if ! start_vllm "B_thresh${THRESH}" \
             --prefetch-block-threshold "$THRESH" \
-            --max-prefetch-block-ratio 0.3 \
-            || exit 1
+            --max-prefetch-block-ratio 0.3; then
+            record_skip "[Group B] thresh=${THRESH} vLLM 启动失败"
+            stop_vllm
+            continue
+        fi
 
         run_experiment "B-thresh${THRESH}" "prefetch" "$DEFAULT_QPS" "$DEFAULT_LEAD_TIME" \
-            "B_thresh${THRESH}_q${DEFAULT_QPS}"
+            "B_thresh${THRESH}_q${DEFAULT_QPS}" \
+            || record_skip "[Group B] thresh=${THRESH} 实验失败"
 
         stop_vllm
     done
@@ -298,13 +315,17 @@ if should_run C; then
     print_phase "[Group C] Prefetch Quota Ratio Ablation"
 
     for RATIO in 0.0 0.1 0.2 0.3 0.5 1.0; do
-        start_vllm "C_ratio${RATIO}" \
+        if ! start_vllm "C_ratio${RATIO}" \
             --prefetch-block-threshold 150 \
-            --max-prefetch-block-ratio "$RATIO" \
-            || exit 1
+            --max-prefetch-block-ratio "$RATIO"; then
+            record_skip "[Group C] ratio=${RATIO} vLLM 启动失败"
+            stop_vllm
+            continue
+        fi
 
         run_experiment "C-ratio${RATIO}" "prefetch" "$DEFAULT_QPS" "$DEFAULT_LEAD_TIME" \
-            "C_ratio${RATIO}_q${DEFAULT_QPS}"
+            "C_ratio${RATIO}_q${DEFAULT_QPS}" \
+            || record_skip "[Group C] ratio=${RATIO} 实验失败"
 
         stop_vllm
     done
@@ -319,17 +340,20 @@ fi
 if should_run D; then
     print_phase "[Group D] Prefetch Lead Time Ablation"
 
-    start_vllm "D_leadtime" \
+    if ! start_vllm "D_leadtime" \
         --prefetch-block-threshold 150 \
-        --max-prefetch-block-ratio 0.3 \
-        || exit 1
+        --max-prefetch-block-ratio 0.3; then
+        record_skip "[Group D] vLLM 启动失败"
+        stop_vllm
+    else
+        for LT in 0.0 1.0 2.0 5.0 10.0 30.0; do
+            run_experiment "D-lead${LT}" "prefetch" "$DEFAULT_QPS" "$LT" \
+                "D_lead${LT}_q${DEFAULT_QPS}" \
+                || record_skip "[Group D] lead_time=${LT} 实验失败"
+        done
 
-    for LT in 0.0 1.0 2.0 5.0 10.0 30.0; do
-        run_experiment "D-lead${LT}" "prefetch" "$DEFAULT_QPS" "$LT" \
-            "D_lead${LT}_q${DEFAULT_QPS}"
-    done
-
-    stop_vllm
+        stop_vllm
+    fi
 fi
 
 # ============================================================
@@ -341,20 +365,24 @@ fi
 if should_run E; then
     print_phase "[Group E] QPS Load Sensitivity"
 
-    start_vllm "E_qps" \
+    if ! start_vllm "E_qps" \
         --prefetch-block-threshold 150 \
-        --max-prefetch-block-ratio 0.3 \
-        || exit 1
+        --max-prefetch-block-ratio 0.3; then
+        record_skip "[Group E] vLLM 启动失败"
+        stop_vllm
+    else
+        for Q in 0.2 0.4 0.6 0.8 1.0; do
+            run_experiment "E-baseline-q${Q}" "baseline" "$Q" "$DEFAULT_LEAD_TIME" \
+                "E_baseline_q${Q}" \
+                || record_skip "[Group E] baseline qps=${Q} 实验失败"
 
-    for Q in 0.2 0.4 0.6 0.8 1.0; do
-        run_experiment "E-baseline-q${Q}" "baseline" "$Q" "$DEFAULT_LEAD_TIME" \
-            "E_baseline_q${Q}"
+            run_experiment "E-prefetch-q${Q}" "prefetch" "$Q" "$DEFAULT_LEAD_TIME" \
+                "E_prefetch_q${Q}" \
+                || record_skip "[Group E] prefetch qps=${Q} 实验失败"
+        done
 
-        run_experiment "E-prefetch-q${Q}" "prefetch" "$Q" "$DEFAULT_LEAD_TIME" \
-            "E_prefetch_q${Q}"
-    done
-
-    stop_vllm
+        stop_vllm
+    fi
 fi
 
 # ============================================================
@@ -447,4 +475,9 @@ echo "  ID:      $EXP_ID"
 echo "  Results: $RESULTS_DIR"
 echo "  Report:  $REPORT"
 echo "  TSV:     $ABLATION_TABLE_TSV"
+if [[ $SKIP_COUNT -gt 0 ]]; then
+    echo ""
+    echo "  ⚠️  Skipped $SKIP_COUNT experiment(s):"
+    echo -e "$FAIL_LOG"
+fi
 print_separator
