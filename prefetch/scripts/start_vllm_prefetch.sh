@@ -12,15 +12,22 @@
 set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUN_EXP_DIR="$(cd "$SCRIPT_DIR/../../run-experiment" && pwd)"
+PREFETCH_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+RUN_EXP_DIR="$(cd "$PREFETCH_ROOT/../run-experiment" && pwd)"
 
-# 加载配置
+# 加载配置 - 优先使用 prefetch 专用配置
 source "$RUN_EXP_DIR/config/system.env"
-source "$RUN_EXP_DIR/config/experiments.env"
 
-# 默认值
-PREFETCH_BLOCK_THRESHOLD=150
-MAX_PREFETCH_BLOCK_RATIO=0.3
+PREFETCH_CONFIG="$PREFETCH_ROOT/config/prefetch_experiments.env"
+if [[ -f "$PREFETCH_CONFIG" ]]; then
+    source "$PREFETCH_CONFIG"
+else
+    source "$RUN_EXP_DIR/config/experiments.env"
+fi
+
+# 默认值（可被命令行参数覆盖）
+PREFETCH_BLOCK_THRESHOLD="${PREFETCH_BLOCK_THRESHOLD:-150}"
+MAX_PREFETCH_BLOCK_RATIO="${MAX_PREFETCH_BLOCK_RATIO:-0.3}"
 LOG_FILE="${VLLM_LOG:-vllm_prefetch.log}"
 
 # 解析参数
@@ -49,7 +56,9 @@ echo "Prefetch 消融实验: 启动 vLLM"
 echo "============================================"
 echo "GPU(s): $FREE_GPUS"
 echo "Model: $MODEL_PATH"
+echo "Tensor Parallel: $VLLM_TENSOR_PARALLEL_SIZE"
 echo "GPU blocks: $NUM_GPU_BLOCKS_OVERRIDE"
+[[ -n "$MAX_MODEL_LEN" ]] && echo "Max seq len: $MAX_MODEL_LEN (limited)" || echo "Max seq len: default (40960)"
 echo "Prefetch threshold: $PREFETCH_BLOCK_THRESHOLD"
 echo "Prefetch quota ratio: $MAX_PREFETCH_BLOCK_RATIO"
 echo "KV offloading: ${KV_OFFLOADING_SIZE} GiB"
@@ -73,6 +82,10 @@ CMD_ARGS=(
 
 if [ -n "$NUM_GPU_BLOCKS_OVERRIDE" ] && [ "$NUM_GPU_BLOCKS_OVERRIDE" != "auto" ]; then
   CMD_ARGS+=(--num-gpu-blocks-override "$NUM_GPU_BLOCKS_OVERRIDE")
+fi
+
+if [ -n "$MAX_MODEL_LEN" ] && [ "$MAX_MODEL_LEN" != "0" ]; then
+  CMD_ARGS+=(--max-model-len "$MAX_MODEL_LEN")
 fi
 
 if [ -n "$KV_OFFLOADING_SIZE" ] && [ "$KV_OFFLOADING_SIZE" != "0" ]; then

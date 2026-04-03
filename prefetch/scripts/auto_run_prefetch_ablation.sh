@@ -16,7 +16,7 @@
 #   ./auto_run_prefetch_ablation.sh optimal --groups A,B,C,D,E
 #
 # 选项:
-#   --qps N              默认 QPS (用于非 E 组实验, default: 1.0)
+#   --qps N              默认 QPS (用于非 E 组实验, default: 0.5)
 #   --lead-time N        默认提前量秒 (用于非 D 组, default: 2.0)
 #   --gpu-blocks N       覆盖 GPU block 数量
 #   --groups A,B,C,D,E   选择要运行的实验组 (default: A,B,C,D)
@@ -102,41 +102,62 @@ trap cleanup EXIT INT TERM
 # 加载配置
 # ============================================================
 
-source config/system.env
-source config/datasets.env
-source config/experiments.env
-source scripts/utils/common.sh
+# 加载 run-experiment 的通用配置
+source "$RUN_EXP_DIR/config/system.env"
+source "$RUN_EXP_DIR/config/datasets.env"
+source "$RUN_EXP_DIR/scripts/utils/common.sh"
+
+# 覆盖为 prefetch 专用配置
+PREFETCH_CONFIG="$PREFETCH_ROOT/config/prefetch_experiments.env"
+if [[ -f "$PREFETCH_CONFIG" ]]; then
+    source "$PREFETCH_CONFIG"
+    echo "✓ Loaded prefetch config: $PREFETCH_CONFIG"
+else
+    echo "⚠️  Prefetch config not found: $PREFETCH_CONFIG"
+    echo "   Using run-experiment defaults"
+    source "$RUN_EXP_DIR/config/experiments.env"
+fi
 
 DATASET="${1:-optimal}"
 shift 2>/dev/null || true
 
 # 默认值
-DEFAULT_QPS="${QPS:-1.0}"
+DEFAULT_QPS="${QPS:-0.5}"
 DEFAULT_LEAD_TIME="${PREFETCH_LEAD_TIME:-2.0}"
 RUN_GROUPS="A,B,C,D"
+NUM_GPU_BLOCKS_OVERRIDE_SET=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --qps)         DEFAULT_QPS="$2"; shift 2 ;;
         --lead-time)   DEFAULT_LEAD_TIME="$2"; shift 2 ;;
-        --gpu-blocks)  NUM_GPU_BLOCKS_OVERRIDE="$2"; shift 2 ;;
+        --gpu-blocks)  NUM_GPU_BLOCKS_OVERRIDE="$2"; NUM_GPU_BLOCKS_OVERRIDE_SET=1; shift 2 ;;
         --groups)      RUN_GROUPS="$(echo "$2" | tr '[:lower:]' '[:upper:]')"; shift 2 ;;
         *)
-            echo "Unknown option: $1"; exit 1 ;;
+            echo "Unknown option: $1"
+            echo "Usage: $0 [dataset] [--qps N] [--lead-time N] [--gpu-blocks N] [--groups A,B,C,D,E]"
+            exit 1 ;;
     esac
 done
 
 should_run() { [[ ",$RUN_GROUPS," == *",$1,"* ]]; }
 
 load_dataset_config "$DATASET"
-[[ -z "$NUM_GPU_BLOCKS_OVERRIDE" || "$NUM_GPU_BLOCKS_OVERRIDE" == "0" ]] && \
-    NUM_GPU_BLOCKS_OVERRIDE="${DATASET_GPU_BLOCKS:-550}"
+[[ $NUM_GPU_BLOCKS_OVERRIDE_SET -eq 0 ]] && NUM_GPU_BLOCKS_OVERRIDE="${DATASET_GPU_BLOCKS:-$NUM_GPU_BLOCKS_OVERRIDE}"
 
 generate_dataset_if_needed "$TRACE" "$FULL_TRACE" "$DATASET" || exit 1
 
-# Timeout
-REQUEST_TIMEOUT="${REQUEST_TIMEOUT:-240}"
-RUNNER_TIMEOUT_ARGS=(--request-timeout "$REQUEST_TIMEOUT")
+# Timeout 配置 (与原脚本保持一致)
+RUNNER_TIMEOUT_ARGS=(--timeout "$TIMEOUT" --request-timeout "$REQUEST_TIMEOUT")
+if [[ "$DATASET" == "pcie-full" || "$DATASET" == "pcie-trace-a-light" || "$DATASET" == "pcie-multiturn" || "$DATASET" == "pcie-heavy" ]]; then
+    if [[ ! -f "$TRACE" ]]; then
+        echo "❌ $DATASET: trace 不存在: $TRACE"
+        exit 1
+    fi
+    REQUEST_TIMEOUT=360
+    TIMEOUT=""
+    RUNNER_TIMEOUT_ARGS=(--request-timeout "$REQUEST_TIMEOUT")
+fi
 
 MAX_OUTPUT_ARGS=()
 [[ -n "$MAX_OUTPUT" ]] && MAX_OUTPUT_ARGS=(--max-output-tokens "$MAX_OUTPUT")
@@ -154,7 +175,7 @@ for pat, lab in [(r'72b','72B'),(r'32b','32B'),(r'8b','8B')]:
 else: print('unknown')
 " "$MODEL_PATH")"
 
-EXP_ID="${EXP_TS}_prefetch_ablation_${DATASET}_q${DEFAULT_QPS}_${MODEL_TAG}"
+EXP_ID="${EXP_TS}_prefetch_ablation_${DATASET}_q${DEFAULT_QPS}_lead${DEFAULT_LEAD_TIME}_${MODEL_TAG}"
 RESULTS_DIR="$PREFETCH_ROOT/results/$EXP_ID"
 mkdir -p "$RESULTS_DIR"
 
@@ -182,9 +203,11 @@ print_separator
 echo "ID:         $EXP_ID"
 echo "Dataset:    $DATASET ($TRACE)"
 echo "Num conv:   $NUM_CONV"
+echo "GPU:        Single card (TP=$VLLM_TENSOR_PARALLEL_SIZE)"
 echo "QPS:        $DEFAULT_QPS"
 echo "Lead time:  ${DEFAULT_LEAD_TIME}s"
-echo "GPU blocks: $NUM_GPU_BLOCKS_OVERRIDE"
+echo "GPU blocks: $NUM_GPU_BLOCKS_OVERRIDE (from: $([ $NUM_GPU_BLOCKS_OVERRIDE_SET -eq 1 ] && echo "CLI --gpu-blocks" || echo "config"))"
+[[ -n "$MAX_MODEL_LEN" ]] && echo "Max seq len: $MAX_MODEL_LEN (limited for single GPU)"
 echo "Groups:     $RUN_GROUPS"
 echo "Results:    $RESULTS_DIR"
 print_separator
@@ -323,7 +346,7 @@ if should_run E; then
         --max-prefetch-block-ratio 0.3 \
         || exit 1
 
-    for Q in 0.2 0.4 0.6 0.8 1.0 1.5; do
+    for Q in 0.2 0.4 0.6 0.8 1.0; do
         run_experiment "E-baseline-q${Q}" "baseline" "$Q" "$DEFAULT_LEAD_TIME" \
             "E_baseline_q${Q}"
 
@@ -390,6 +413,30 @@ else:
 echo "Report: $REPORT"
 
 # ============================================================
+# 追加到 Prefetch Ablation TSV 表格
+# ============================================================
+
+ABLATION_TABLE_TSV="$PREFETCH_ROOT/results/prefetch_ablation_experiments.txt"
+if [[ -f "$PREFETCH_ROOT/../result-analysis/append_prefetch_ablation_summary_row.py" ]]; then
+    python3 "$PREFETCH_ROOT/../result-analysis/append_prefetch_ablation_summary_row.py" \
+        --results-dir "$RESULTS_DIR" \
+        --exp-id "$EXP_ID" \
+        --dataset "$DATASET" \
+        --default-qps "$DEFAULT_QPS" \
+        --default-lead-time "$DEFAULT_LEAD_TIME" \
+        --num-gpu-blocks "$NUM_GPU_BLOCKS_OVERRIDE" \
+        --num-conv "$NUM_CONV" \
+        --gpu-mem-util "$GPU_MEMORY_UTILIZATION" \
+        --max-num-seqs "$VLLM_MAX_NUM_SEQS" \
+        --model-path "$MODEL_PATH" \
+        --table "$ABLATION_TABLE_TSV" \
+        && echo "✓ Appended results to $ABLATION_TABLE_TSV" || \
+        echo "⚠️  append_prefetch_ablation_summary_row.py failed"
+else
+    echo "⚠️  append_prefetch_ablation_summary_row.py not found, skip TSV append"
+fi
+
+# ============================================================
 # 完成
 # ============================================================
 
@@ -399,4 +446,5 @@ echo ""
 echo "  ID:      $EXP_ID"
 echo "  Results: $RESULTS_DIR"
 echo "  Report:  $REPORT"
+echo "  TSV:     $ABLATION_TABLE_TSV"
 print_separator
