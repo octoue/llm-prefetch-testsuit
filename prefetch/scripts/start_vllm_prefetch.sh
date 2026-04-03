@@ -1,0 +1,92 @@
+#!/bin/bash
+# 启动 vLLM 用于 Prefetch 消融实验（不依赖 PCIe 调度器 / PP）
+#
+# 用法: ./start_vllm_prefetch.sh [options]
+#   --gpu-blocks N              覆盖 GPU block 数量
+#   --prefetch-block-threshold N  准入控制阈值 (default: 150)
+#   --max-prefetch-block-ratio F  配额比例 (default: 0.3)
+#   --log-file PATH             日志输出路径
+#
+# 环境变量: 从 ../../run-experiment/config/ 加载
+
+set -eo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUN_EXP_DIR="$(cd "$SCRIPT_DIR/../../run-experiment" && pwd)"
+
+# 加载配置
+source "$RUN_EXP_DIR/config/system.env"
+source "$RUN_EXP_DIR/config/experiments.env"
+
+# 默认值
+PREFETCH_BLOCK_THRESHOLD=150
+MAX_PREFETCH_BLOCK_RATIO=0.3
+LOG_FILE="${VLLM_LOG:-vllm_prefetch.log}"
+
+# 解析参数
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --gpu-blocks)                 NUM_GPU_BLOCKS_OVERRIDE="$2"; shift 2 ;;
+        --prefetch-block-threshold)   PREFETCH_BLOCK_THRESHOLD="$2"; shift 2 ;;
+        --max-prefetch-block-ratio)   MAX_PREFETCH_BLOCK_RATIO="$2"; shift 2 ;;
+        --log-file)                   LOG_FILE="$2"; shift 2 ;;
+        *)
+            echo "Unknown option: $1"
+            exit 1 ;;
+    esac
+done
+
+# 自动选择空闲 GPU
+FREE_GPUS=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits \
+    | sort -t',' -k2 -n \
+    | head -n "${VLLM_TENSOR_PARALLEL_SIZE:-1}" \
+    | cut -d',' -f1 \
+    | tr -d ' ' \
+    | paste -sd',')
+
+echo "============================================"
+echo "Prefetch 消融实验: 启动 vLLM"
+echo "============================================"
+echo "GPU(s): $FREE_GPUS"
+echo "Model: $MODEL_PATH"
+echo "GPU blocks: $NUM_GPU_BLOCKS_OVERRIDE"
+echo "Prefetch threshold: $PREFETCH_BLOCK_THRESHOLD"
+echo "Prefetch quota ratio: $MAX_PREFETCH_BLOCK_RATIO"
+echo "KV offloading: ${KV_OFFLOADING_SIZE} GiB"
+echo "============================================"
+
+CMD_ARGS=(
+  --model "$MODEL_PATH"
+  --host "${VLLM_HOST:-0.0.0.0}"
+  --port "${API_PORT:-8000}"
+  --max-num-seqs "${VLLM_MAX_NUM_SEQS:-96}"
+  --block-size "${VLLM_BLOCK_SIZE:-16}"
+  --tensor-parallel-size "${VLLM_TENSOR_PARALLEL_SIZE:-1}"
+  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.7}"
+  --enable-prefix-caching
+  --enable-prompt-tokens-details
+  --trust-remote-code
+  --disable-hybrid-kv-cache-manager
+  --prefetch-block-threshold "$PREFETCH_BLOCK_THRESHOLD"
+  --max-prefetch-block-ratio "$MAX_PREFETCH_BLOCK_RATIO"
+)
+
+if [ -n "$NUM_GPU_BLOCKS_OVERRIDE" ] && [ "$NUM_GPU_BLOCKS_OVERRIDE" != "auto" ]; then
+  CMD_ARGS+=(--num-gpu-blocks-override "$NUM_GPU_BLOCKS_OVERRIDE")
+fi
+
+if [ -n "$KV_OFFLOADING_SIZE" ] && [ "$KV_OFFLOADING_SIZE" != "0" ]; then
+  CMD_ARGS+=(--kv-offloading-size "$KV_OFFLOADING_SIZE")
+  CMD_ARGS+=(--kv-offloading-backend "native")
+  CMD_ARGS+=(--swap-space "${SWAP_SPACE:-256}")
+fi
+
+export VLLM_LOGGING_LEVEL="${VLLM_LOG_LEVEL:-INFO}"
+
+# 日志过滤 (与 pcie 版本一致)
+NOISE_FILTER='offload (MISS|HIT)|scheduling CPU->GPU load|Prefetch .+: (CPU hit|GPU hit|NO HIT|CPU load complete|deferred)|Block allocation failed|Delaying request|offloading [0-9]+ blocks'
+
+VLLM_SERVER_DEV_MODE=1 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=$FREE_GPUS \
+  vllm serve "${CMD_ARGS[@]}" 2>&1 \
+  | grep --line-buffered -Ev "$NOISE_FILTER" \
+  | tee "$LOG_FILE"
