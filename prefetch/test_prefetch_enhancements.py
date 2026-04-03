@@ -165,18 +165,27 @@ class TestPrefetchStats:
         """make_stats should drain counters and reset them."""
         scheduler = create_scheduler(enable_prefix_caching=True)
 
-        # Generate some no-hit prefetch.
+        # Generate no-hit prefetch requests with truly unique prompts.
+        # create_requests(num_requests=1, same_prompt=False) always yields
+        # [0]*num_tokens (inner i=0), so we manually set distinct tokens.
         for i in range(3):
             req = create_requests(
                 num_requests=1, num_tokens=32, max_tokens=16,
-                req_ids=[f"pf-{i}"],
+                req_ids=[f"pf-drain-{i}"],
             )[0]
+            # Overwrite prompt to be unique and not overlap with anything.
+            req.prompt_token_ids = [100 + i] * 32
             req.prefetch_only = True
             scheduler.add_request(req)
             sched_out = scheduler.schedule()
             scheduler.update_from_output(sched_out, _empty_model_output())
 
-        assert scheduler._prefetch_no_hits == 3
+        assert scheduler._prefetch_no_hits == 3, (
+            f"Expected 3 no-hits, got gpu={scheduler._prefetch_gpu_hits} "
+            f"cpu={scheduler._prefetch_cpu_hits} "
+            f"no_hit={scheduler._prefetch_no_hits} "
+            f"deferred={scheduler._prefetch_deferred}"
+        )
 
         stats = scheduler.make_stats()
         assert stats is not None
@@ -190,14 +199,14 @@ class TestPrefetchStats:
         """Mixed GPU-hit and no-hit should be counted in separate buckets."""
         scheduler = create_scheduler(enable_prefix_caching=True)
 
-        # Normal request to populate cache.
+        # Normal request to populate cache with prompt [0]*32.
         normal_reqs = create_requests(
             num_requests=1, num_tokens=32, max_tokens=16, same_prompt=True,
             req_ids=["normal-0"],
         )
         _run_normal_request(scheduler, normal_reqs[0])
 
-        # GPU-hit prefetch (same prompt).
+        # GPU-hit prefetch (same prompt [0]*32).
         gpu_req = create_requests(
             num_requests=1, num_tokens=32, max_tokens=16, same_prompt=True,
             req_ids=["pf-gpu-0"],
@@ -206,17 +215,23 @@ class TestPrefetchStats:
         scheduler.add_request(gpu_req)
         scheduler.schedule()
 
-        # No-hit prefetch (different prompt).
+        # No-hit prefetch: use a completely different token to avoid
+        # prefix overlap. [999]*32 shares no prefix with [0]*32.
         no_hit_req = create_requests(
-            num_requests=1, num_tokens=64, max_tokens=16,
+            num_requests=1, num_tokens=32, max_tokens=16,
             req_ids=["pf-nohit-0"],
         )[0]
+        no_hit_req.prompt_token_ids = [999] * 32
         no_hit_req.prefetch_only = True
         scheduler.add_request(no_hit_req)
         scheduler.schedule()
 
-        assert scheduler._prefetch_gpu_hits == 1
-        assert scheduler._prefetch_no_hits == 1
+        assert scheduler._prefetch_gpu_hits == 1, (
+            f"gpu={scheduler._prefetch_gpu_hits}"
+        )
+        assert scheduler._prefetch_no_hits == 1, (
+            f"no_hit={scheduler._prefetch_no_hits}"
+        )
         assert scheduler._prefetch_cpu_hits == 0
 
 
@@ -281,6 +296,7 @@ class TestPrefetchQuota:
             max_num_seqs=16,
             max_num_batched_tokens=8192,
             max_model_len=8192,
+            is_encoder_decoder=False,
             max_prefetch_block_ratio=0.0,
         )
         assert cfg.max_prefetch_block_ratio == 0.0
