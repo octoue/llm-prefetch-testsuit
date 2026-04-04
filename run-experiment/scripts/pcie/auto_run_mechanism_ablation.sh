@@ -140,12 +140,14 @@ shift 2>/dev/null || true
 
 NUM_GPU_BLOCKS_OVERRIDE_SET=0
 RUN_GROUPS="no-pq,no-ef,no-cc"  # 默认只跑 3 个新消融组
+OPEN_LOOP=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --qps)             QPS="$2"; shift 2 ;;
         --lead-time)       PREFETCH_LEAD_TIME="$2"; shift 2 ;;
         --gpu-blocks)      NUM_GPU_BLOCKS_OVERRIDE="$2"; NUM_GPU_BLOCKS_OVERRIDE_SET=1; shift 2 ;;
+        --open-loop)       OPEN_LOOP=1; shift ;;
         --groups)
             _g="$(echo "$2" | tr '[:upper:]' '[:lower:]')"
             if [[ "$_g" == "all" ]]; then
@@ -156,7 +158,7 @@ while [[ $# -gt 0 ]]; do
             shift 2 ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [dataset] [--qps N] [--lead-time N] [--gpu-blocks N] [--groups g0,g1,full,no-pq,no-ef,no-cc|all]"
+            echo "Usage: $0 [dataset] [--qps N] [--lead-time N] [--gpu-blocks N] [--open-loop] [--groups g0,g1,full,no-pq,no-ef,no-cc|all]"
             exit 1 ;;
     esac
 done
@@ -264,7 +266,9 @@ print_separator
 echo "Mechanism Ablation Experiment"
 print_separator
 echo "Experiment ID: $EXP_ID"
-echo "Dataset: $DATASET | QPS: $QPS | Lead: ${PREFETCH_LEAD_TIME}s | Blocks: $NUM_GPU_BLOCKS_OVERRIDE"
+LOOP_LABEL="closed-loop"
+[[ "${OPEN_LOOP:-0}" -eq 1 ]] && LOOP_LABEL="open-loop"
+echo "Dataset: $DATASET | QPS: $QPS | Lead: ${PREFETCH_LEAD_TIME}s | Blocks: $NUM_GPU_BLOCKS_OVERRIDE | Scheduling: $LOOP_LABEL"
 echo "Groups: $RUN_GROUPS"
 echo "Results: $RESULTS_DIR"
 print_separator
@@ -304,6 +308,9 @@ run_phase() {
     echo "Starting PCIe profiler..."
     curl -s -X POST "http://localhost:$API_PORT/start_profile" >/dev/null || true
 
+    OPEN_LOOP_ARGS=()
+    [[ "${OPEN_LOOP:-0}" -eq 1 ]] && OPEN_LOOP_ARGS=(--open-loop)
+
     local run_status=0
     python3 prefetch_ab_runner.py \
         --trace-file "$TRACE" \
@@ -318,6 +325,7 @@ run_phase() {
         "${MAX_OUTPUT_ARGS[@]}" \
         --prefetch-lead-time "$PREFETCH_LEAD_TIME" \
         --schedule-mode "$SCHEDULE_MODE" \
+        "${OPEN_LOOP_ARGS[@]}" \
         2>&1 | tee "$RESULTS_DIR/prefetch_${SUFFIX}.log" || run_status=$?
 
     if [[ $run_status -ne 0 ]]; then

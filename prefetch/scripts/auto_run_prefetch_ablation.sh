@@ -105,8 +105,18 @@ stop_vllm() {
     sleep 3
 }
 
-cleanup() { echo ""; echo "Cleaning up..."; stop_vllm; }
-trap cleanup EXIT INT TERM
+cleanup() {
+    echo ""
+    echo "Cleaning up (PID $$)..."
+    stop_vllm
+    # 终止本脚本的所有子进程 (python runner 等)
+    pkill -P $$ 2>/dev/null || true
+    rm -f "$SCRIPT_DIR/.ablation.pid" 2>/dev/null
+}
+trap cleanup EXIT INT TERM HUP
+
+# 写入 PID 文件, 供 kill_ablation.sh 使用
+echo $$ > "$SCRIPT_DIR/.ablation.pid"
 
 # ============================================================
 # 加载配置

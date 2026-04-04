@@ -50,6 +50,7 @@ class PrefetchABRunner:
         seed: int = 42,
         request_timeout: Optional[float] = None,
         max_output_tokens: Optional[int] = None,
+        open_loop: bool = False,
     ):
         self.trace_file = trace_file
         self.api_base = api_base
@@ -59,6 +60,7 @@ class PrefetchABRunner:
         self.seed = seed
         self.request_timeout = request_timeout  # 仅轻量化测试使用，None 时保持 OpenAI 默认 600s
         self.max_output_tokens = max_output_tokens  # 限制单请求最大生成 token 数
+        self.open_loop = open_loop  # Open-loop: 每个请求按计划时间独立发送，不等前一轮完成
 
         # 在 seed 设置后生成单词池，确保两次运行生成完全相同的文本
         random.seed(seed)
@@ -237,6 +239,54 @@ class PrefetchABRunner:
             scheduled_map[(r["chat_id"], r["turn"])] = i * interval
         return workload, scheduled_map
 
+    def _pre_generate_all_messages(
+        self, workload: List[Tuple[str, List[Dict]]]
+    ) -> Dict[Tuple[int, int], Tuple[List[Dict], str, Dict, int]]:
+        """Open-loop: 预生成所有轮次的消息历史，使每个请求可独立发送。
+
+        Returns:
+            dict mapping (chat_id, turn) -> (messages, conv_type, record, history_tokens)
+        """
+        pre_generated = {}
+        for conv_type, chain in workload:
+            messages: List[Dict] = []
+            for record in chain:
+                chat_id, turn = record["chat_id"], record["turn"]
+
+                # 与 _process_conversation 一致的 user message 生成逻辑
+                history_tokens = (
+                    self._count_tokens(
+                        "\n".join(f"{m['role']}: {m['content']}" for m in messages)
+                    )
+                    if messages
+                    else 0
+                )
+                new_user_tokens = max(10, record["input_length"] - history_tokens)
+                user_msg = self._generate_text_with_tokens(
+                    new_user_tokens, chat_id=chat_id, turn=turn
+                )
+                messages.append({"role": "user", "content": user_msg})
+
+                # 保存当前轮次请求所需的 messages 快照
+                pre_generated[(chat_id, turn)] = (
+                    [m.copy() for m in messages],
+                    conv_type,
+                    record,
+                    history_tokens,
+                )
+
+                # 用 placeholder assistant response 填充历史，供后续轮次使用
+                output_tokens = record["output_length"]
+                if self.max_output_tokens is not None:
+                    output_tokens = min(output_tokens, self.max_output_tokens)
+                placeholder = self._generate_text_with_tokens(
+                    output_tokens, chat_id=chat_id, turn=turn, placeholder=True
+                )
+                messages.append({"role": "assistant", "content": placeholder})
+
+        print(f"[Open-loop] 预生成 {len(pre_generated)} 个请求的消息历史")
+        return pre_generated
+
     async def _send_prefetch(
         self, messages: List[Dict]
     ) -> Tuple[float, Optional[str], Optional[int], Optional[int]]:
@@ -326,6 +376,101 @@ class PrefetchABRunner:
             "error": error_msg,
             "text": text,
         }
+
+    async def _process_single_request(
+        self,
+        record: Dict,
+        messages: List[Dict],
+        conv_type: str,
+        history_tokens: int,
+        scheduled_abs: float,
+        output_file,
+        output_lock: asyncio.Lock,
+    ):
+        """Open-loop: 在计划时间独立发送单个请求，不等待同会话前序轮次完成。"""
+        if self._is_timeout():
+            return
+
+        # Prefetch（仅 prefetch 模式 + 多轮 + 有历史消息时）
+        prefetch_time_ms = None
+        prefetch_cached_tokens = None
+        prefetch_prompt_tokens = None
+        if self.mode == "prefetch" and conv_type == "multi" and len(messages) > 1:
+            prefetch_at = scheduled_abs - self.prefetch_lead_time
+            wait_prefetch = prefetch_at - time.time()
+            if wait_prefetch > 0:
+                await asyncio.sleep(wait_prefetch)
+            if self._is_timeout():
+                return
+            elapsed, err, cached, ptokens = await self._send_prefetch(messages.copy())
+            prefetch_time_ms = elapsed * 1000
+            prefetch_cached_tokens = cached
+            prefetch_prompt_tokens = ptokens
+            if err:
+                print(f"[Prefetch 失败] chat_id={record['chat_id']} turn={record['turn']}: {err}")
+            elif cached is not None and cached > 0 and ptokens is not None:
+                hit_ratio = cached / ptokens if ptokens > 0 else 0
+                source = "GPU_HIT" if elapsed < 0.1 else "CPU_LOAD"
+                print(
+                    f"[Prefetch {source}] chat_id={record['chat_id']} turn={record['turn']}: "
+                    f"cached={cached}/{ptokens} ({hit_ratio:.0%}), elapsed={elapsed*1000:.0f}ms"
+                )
+
+        # 等待到计划发送时间
+        wait_time = scheduled_abs - time.time()
+        if wait_time > 0:
+            await asyncio.sleep(wait_time)
+        if self._is_timeout():
+            return
+
+        # 发送请求
+        output_tokens = record["output_length"]
+        if self.max_output_tokens is not None:
+            output_tokens = min(output_tokens, self.max_output_tokens)
+        result = await self._send_streaming_request(messages, output_tokens)
+
+        # 写日志
+        log_row = {
+            "chat_id": record["chat_id"],
+            "turn": record["turn"],
+            "mode": self.mode,
+            "is_multi_turn": conv_type == "multi",
+            "ttft_ms": result["ttft"] * 1000,
+            "tpot_ms": result["tpot"] * 1000,
+            "total_time_ms": result["total_time"] * 1000,
+            "tokens_per_sec": result["tokens_per_sec"],
+            "prompt_tokens": result["prompt_tokens"],
+            "completion_tokens": result["completion_tokens"],
+            "cached_tokens": result["cached_tokens"],
+            "prefetch_time_ms": prefetch_time_ms,
+            "prefetch_elapsed_ms": prefetch_time_ms,
+            "prefetch_cached_tokens": prefetch_cached_tokens,
+            "prefetch_prompt_tokens": prefetch_prompt_tokens,
+            "history_tokens": history_tokens if conv_type == "multi" else None,
+            "success": result["success"],
+            "error": result["error"],
+            "timestamp": time.time(),
+            "open_loop": True,
+        }
+        async with output_lock:
+            output_file.write(json.dumps(log_row, ensure_ascii=False) + "\n")
+            output_file.flush()
+
+        # 更新进度统计
+        async with self._stats_lock:
+            self._completed_count += 1
+            if result["success"]:
+                self._success_count += 1
+                self._ttft_list.append(result["ttft"] * 1000)
+                self._tpot_list.append(result["tpot"] * 1000)
+            if result.get("cached_tokens") and result["cached_tokens"] > 0:
+                self._cached_count += 1
+            if prefetch_cached_tokens is not None and prefetch_cached_tokens > 0:
+                self._prefetch_cached_list.append(prefetch_cached_tokens)
+
+        status = "✓" if result["success"] else "✗"
+        cached_str = f", cached={result['cached_tokens']}" if result["cached_tokens"] is not None else ""
+        print(f"[{status}] {record['chat_id']}_t{record['turn']} TTFT={result['ttft']*1000:.0f}ms{cached_str}")
 
     async def _process_conversation(
         self,
@@ -473,8 +618,14 @@ class PrefetchABRunner:
         }
 
         total_requests = sum(len(c) for _, c in workload)
-        print(f"\n模式={self.mode}, QPS={qps}, 总请求={total_requests}")
+        loop_label = "open-loop" if self.open_loop else "closed-loop"
+        print(f"\n模式={self.mode}, QPS={qps}, 总请求={total_requests}, 调度={loop_label}")
         print("-" * 60)
+
+        # Open-loop: 预生成所有消息历史
+        pre_generated = None
+        if self.open_loop:
+            pre_generated = self._pre_generate_all_messages(scheduled_workload)
 
         async def _progress_reporter() -> None:
             """每 10 秒打印进度摘要"""
@@ -502,11 +653,24 @@ class PrefetchABRunner:
         try:
             with open(output, "w", encoding="utf-8") as out_f:
                 tasks = []
-                for conv_type, chain in scheduled_workload:
-                    task = asyncio.create_task(
-                        self._process_conversation(conv_type, chain, scheduled_map, out_f, output_lock, base_time)
-                    )
-                    tasks.append(task)
+                if self.open_loop and pre_generated is not None:
+                    # Open-loop: 每个请求独立 task，按计划时间发送
+                    for (chat_id, turn), (msgs, conv_type, record, hist_tokens) in pre_generated.items():
+                        sched_abs = scheduled_map.get((chat_id, turn), base_time)
+                        task = asyncio.create_task(
+                            self._process_single_request(
+                                record, msgs, conv_type, hist_tokens,
+                                sched_abs, out_f, output_lock,
+                            )
+                        )
+                        tasks.append(task)
+                else:
+                    # Closed-loop: 每个会话一个 task，轮次串行
+                    for conv_type, chain in scheduled_workload:
+                        task = asyncio.create_task(
+                            self._process_conversation(conv_type, chain, scheduled_map, out_f, output_lock, base_time)
+                        )
+                        tasks.append(task)
                 progress_task = asyncio.create_task(_progress_reporter())
                 await asyncio.gather(*tasks)
         finally:
@@ -548,6 +712,9 @@ async def main():
     parser.add_argument("--seed", type=int, default=42, help="随机种子，确保两次运行生成完全相同的对话文本")
     parser.add_argument("--max-output-tokens", type=int, default=None,
                         help="限制单请求最大生成 token 数（clip trace 中的 output_length）")
+    parser.add_argument("--open-loop", action="store_true", default=False,
+                        help="Open-loop 模式：所有请求按计划时间独立发送，不等待前一轮完成。"
+                             "消除多轮对话串行依赖对有效 QPS 的限制。")
     args = parser.parse_args()
 
     runner = PrefetchABRunner(
@@ -559,6 +726,7 @@ async def main():
         seed=args.seed,
         request_timeout=args.request_timeout,
         max_output_tokens=args.max_output_tokens,
+        open_loop=args.open_loop,
     )
     await runner.run(
         num_multi_turn=args.num_multi_turn,
