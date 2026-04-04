@@ -9,7 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ABLATION_SCRIPT="$SCRIPT_DIR/auto_run_mechanism_ablation.sh"
 
 DATASET="pcie-heavy"
-GROUPS="g0,g1,full"
+ABLATION_GROUPS="g0,g1,full"
 
 FAILED=()
 SUCCEEDED=()
@@ -28,7 +28,7 @@ run_one() {
     if bash "$ABLATION_SCRIPT" "$DATASET" \
         --gpu-blocks "$blocks" \
         --qps "$qps" \
-        --groups "$GROUPS"; then
+        --groups "$ABLATION_GROUPS"; then
         SUCCEEDED+=("$label")
         echo "SUCCESS: $label"
     else
