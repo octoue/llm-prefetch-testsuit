@@ -59,6 +59,7 @@ run_one() {
     setsid bash "$ABLATION_SCRIPT" "$DATASET" \
         --gpu-blocks "$blocks" \
         --qps "$qps" \
+        --open-loop \
         --groups "$ABLATION_GROUPS" &
     CHILD_PID=$!
     wait "$CHILD_PID"
