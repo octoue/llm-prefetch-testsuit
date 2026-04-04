@@ -13,11 +13,15 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# 保存调用者通过环境变量传入的 API_PORT（防止被 system.env 覆盖）
+_SAVED_API_PORT="${API_PORT:-}"
+
 # 解析可选参数
 PCIE_SCHEDULER=0
 NO_PP_PHASE_AWARE=0  # 消融实验：禁用 PP Phase 感知，仅验证双队列+Evict-first
 LOG_FILE_OVERRIDE=""
 GPU_BLOCKS_OVERRIDE=""
+PORT_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --pcie-scheduler)
@@ -31,6 +35,9 @@ while [[ $# -gt 0 ]]; do
             shift 2 ;;
         --gpu-blocks)
             GPU_BLOCKS_OVERRIDE="$2"
+            shift 2 ;;
+        --port)
+            PORT_OVERRIDE="$2"
             shift 2 ;;
         medium)
             shift ;;
@@ -47,6 +54,10 @@ set -a
 source "$SCRIPT_DIR/config/system.env"
 source "$SCRIPT_DIR/config/experiments.env"
 set +a
+
+# 恢复端口覆盖: --port > 环境变量 > system.env
+[[ -n "$PORT_OVERRIDE" ]] && API_PORT="$PORT_OVERRIDE"
+[[ -z "$PORT_OVERRIDE" && -n "$_SAVED_API_PORT" ]] && API_PORT="$_SAVED_API_PORT"
 
 # --gpu-blocks 覆盖 system.env 中的 NUM_GPU_BLOCKS_OVERRIDE
 if [[ -n "$GPU_BLOCKS_OVERRIDE" ]]; then
@@ -84,13 +95,14 @@ export VLLM_PCIE_TRACE=1
 PP_SIZE="${VLLM_PIPELINE_PARALLEL_SIZE:-2}"
 NUM_GPUS=$PP_SIZE
 
-# 自动选择显存最空闲的 N 张 GPU（N = PP_SIZE）
-FREE_GPUS=$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits 2>/dev/null | \
-  sort -t',' -k2 -rn | head -n "$NUM_GPUS" | cut -d',' -f1 | tr -d ' ' | paste -sd ',' -)
-if [ -z "$FREE_GPUS" ]; then
-  echo "Warning: nvidia-smi failed, using CUDA_VISIBLE_DEVICES=0,1"
-  FREE_GPUS="0,1"
+# 加载 GPU 锁管理工具，选择空闲且未被其他实验占用的 GPU
+source "$SCRIPT_DIR/scripts/utils/gpu_lock.sh"
+
+if ! wait_for_free_gpus "$NUM_GPUS" 600; then
+  echo "ERROR: 无法获取 $NUM_GPUS 张空闲 GPU，退出"
+  exit 1
 fi
+FREE_GPUS="$ACQUIRED_GPUS"
 
 echo "============================================"
 echo "PCIe Profiling 模式启动 vLLM (PP=$PP_SIZE)"

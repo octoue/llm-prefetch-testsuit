@@ -26,6 +26,8 @@ cd "$RUN_EXP_DIR"
 # ============================================================
 
 VLLM_PID=""
+# 保存调用者传入的 API_PORT（防止被 system.env 覆盖）
+_SAVED_API_PORT="${API_PORT:-}"
 
 start_vllm() {
     local label="$1"; shift
@@ -33,8 +35,11 @@ start_vllm() {
 
     print_phase "Starting vLLM [$label] args: ${args[*]}"
 
-    pkill -f "vllm serve" 2>/dev/null || true
-    sleep 2
+    # 只杀本脚本管理的 vLLM 进程（不影响其他实验）
+    if [[ -n "$VLLM_PID" ]] && kill -0 "$VLLM_PID" 2>/dev/null; then
+        kill "$VLLM_PID" 2>/dev/null || true
+        sleep 2
+    fi
 
     local startup_log="$RESULTS_DIR/vllm_startup_${label}.log"
     nohup bash "$RUN_EXP_DIR/start_vllm_pcie.sh" "${args[@]}" > "$startup_log" 2>&1 &
@@ -85,7 +90,6 @@ stop_vllm() {
         VLLM_PID=""
     fi
 
-    pkill -f "vllm serve" 2>/dev/null || true
     sleep 3
     echo "vLLM stopped"
 }
@@ -94,6 +98,8 @@ cleanup() {
     echo ""
     echo "Cleaning up..."
     stop_vllm
+    # 清理子进程遗留的过期 GPU 锁
+    source "$RUN_EXP_DIR/scripts/utils/gpu_lock.sh" 2>/dev/null && _clean_stale_locks 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -134,6 +140,11 @@ source config/system.env
 source config/datasets.env
 source config/experiments.env
 source scripts/utils/common.sh
+
+# 恢复调用者传入的端口覆盖
+[[ -n "$_SAVED_API_PORT" ]] && API_PORT="$_SAVED_API_PORT"
+API_PORT="${API_PORT:-8000}"
+export API_PORT
 
 DATASET="${1:-pcie-heavy}"
 shift 2>/dev/null || true

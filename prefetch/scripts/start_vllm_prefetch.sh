@@ -15,8 +15,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFETCH_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUN_EXP_DIR="$(cd "$PREFETCH_ROOT/../run-experiment" && pwd)"
 
+# 保存调用者通过环境变量传入的 API_PORT（防止被 system.env 覆盖）
+_SAVED_API_PORT="${API_PORT:-}"
+
 # 加载配置 - 优先使用 prefetch 专用配置
 source "$RUN_EXP_DIR/config/system.env"
+
+# 恢复环境变量中的端口覆盖
+[[ -n "$_SAVED_API_PORT" ]] && API_PORT="$_SAVED_API_PORT"
 
 PREFETCH_CONFIG="$PREFETCH_ROOT/config/prefetch_experiments.env"
 if [[ -f "$PREFETCH_CONFIG" ]]; then
@@ -31,25 +37,32 @@ MAX_PREFETCH_BLOCK_RATIO="${MAX_PREFETCH_BLOCK_RATIO:-0.3}"
 LOG_FILE="${VLLM_LOG:-vllm_prefetch.log}"
 
 # 解析参数
+PORT_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --gpu-blocks)                 NUM_GPU_BLOCKS_OVERRIDE="$2"; shift 2 ;;
         --prefetch-block-threshold)   PREFETCH_BLOCK_THRESHOLD="$2"; shift 2 ;;
         --max-prefetch-block-ratio)   MAX_PREFETCH_BLOCK_RATIO="$2"; shift 2 ;;
         --log-file)                   LOG_FILE="$2"; shift 2 ;;
+        --port)                       PORT_OVERRIDE="$2"; shift 2 ;;
         *)
             echo "Unknown option: $1"
             exit 1 ;;
     esac
 done
 
-# 自动选择空闲 GPU
-FREE_GPUS=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits \
-    | sort -t',' -k2 -n \
-    | head -n "${VLLM_TENSOR_PARALLEL_SIZE:-1}" \
-    | cut -d',' -f1 \
-    | tr -d ' ' \
-    | paste -sd',')
+# --port 覆盖优先级最高
+[[ -n "$PORT_OVERRIDE" ]] && API_PORT="$PORT_OVERRIDE"
+
+# 加载 GPU 锁管理工具，选择空闲且未被其他实验占用的 GPU
+source "$RUN_EXP_DIR/scripts/utils/gpu_lock.sh"
+
+NUM_GPUS="${VLLM_TENSOR_PARALLEL_SIZE:-1}"
+if ! wait_for_free_gpus "$NUM_GPUS" 600; then
+  echo "ERROR: 无法获取 $NUM_GPUS 张空闲 GPU，退出"
+  exit 1
+fi
+FREE_GPUS="$ACQUIRED_GPUS"
 
 echo "============================================"
 echo "Prefetch 消融实验: 启动 vLLM"
@@ -62,6 +75,7 @@ echo "GPU blocks: $NUM_GPU_BLOCKS_OVERRIDE"
 echo "Prefetch threshold: $PREFETCH_BLOCK_THRESHOLD"
 echo "Prefetch quota ratio: $MAX_PREFETCH_BLOCK_RATIO"
 echo "KV offloading: ${KV_OFFLOADING_SIZE} GiB"
+echo "Port: ${API_PORT:-8000}"
 echo "============================================"
 
 CMD_ARGS=(

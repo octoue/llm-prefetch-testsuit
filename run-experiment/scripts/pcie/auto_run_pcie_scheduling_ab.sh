@@ -30,9 +30,11 @@ start_vllm() {
 
     print_phase "Starting vLLM [$label] args: ${args[*]}"
 
-    # 清理残留进程
-    pkill -f "vllm serve" 2>/dev/null || true
-    sleep 2
+    # 只杀本脚本管理的 vLLM 进程（不影响其他实验）
+    if [[ -n "$VLLM_PID" ]] && kill -0 "$VLLM_PID" 2>/dev/null; then
+        kill "$VLLM_PID" 2>/dev/null || true
+        sleep 2
+    fi
 
     local startup_log="$RESULTS_DIR/vllm_startup_${label}.log"
     nohup bash "$RUN_EXP_DIR/start_vllm_pcie.sh" "${args[@]}" > "$startup_log" 2>&1 &
@@ -83,16 +85,15 @@ stop_vllm() {
         VLLM_PID=""
     fi
 
-    # 额外保险
-    pkill -f "vllm serve" 2>/dev/null || true
     sleep 3
-    echo "✓ vLLM stopped"
+    echo "vLLM stopped"
 }
 
 cleanup() {
     echo ""
     echo "Cleaning up..."
     stop_vllm
+    source "$RUN_EXP_DIR/scripts/utils/gpu_lock.sh" 2>/dev/null && _clean_stale_locks 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
