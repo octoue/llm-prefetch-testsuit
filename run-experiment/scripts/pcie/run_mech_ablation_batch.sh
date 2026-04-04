@@ -10,6 +10,14 @@ ABLATION_SCRIPT="$SCRIPT_DIR/auto_run_mechanism_ablation.sh"
 
 DATASET="pcie-heavy"
 ABLATION_GROUPS="g0,g1,full"
+MAX_REQUESTS_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --max-requests) MAX_REQUESTS_ARGS=(--max-requests "$2"); shift 2 ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+done
 
 # 当前正在运行的子实验 PID
 CHILD_PID=""
@@ -60,7 +68,8 @@ run_one() {
         --gpu-blocks "$blocks" \
         --qps "$qps" \
         --open-loop \
-        --groups "$ABLATION_GROUPS" &
+        --groups "$ABLATION_GROUPS" \
+        "${MAX_REQUESTS_ARGS[@]}" &
     CHILD_PID=$!
     wait "$CHILD_PID"
     local rc=$?

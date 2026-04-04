@@ -52,6 +52,7 @@ class PrefetchABRunner:
         max_output_tokens: Optional[int] = None,
         open_loop: bool = False,
         max_model_len: int = 0,
+        max_requests: Optional[int] = None,
     ):
         self.trace_file = trace_file
         self.api_base = api_base
@@ -63,6 +64,7 @@ class PrefetchABRunner:
         self.max_output_tokens = max_output_tokens  # 限制单请求最大生成 token 数
         self.open_loop = open_loop  # Open-loop: 每个请求按计划时间独立发送，不等前一轮完成
         self.max_model_len = max_model_len  # 模型 context window 大小，>0 时自动 clamp output tokens
+        self.max_requests = max_requests  # 只加载 trace 前 N 条，用于快速验证
 
         # 最小生成 token 数 (避免 clamp 到 0)
         self._min_output_tokens = 16
@@ -131,6 +133,18 @@ class PrefetchABRunner:
             parent_id = record["parent_chat_id"]
             if parent_id != -1:
                 self.children_dict[parent_id].append(record["chat_id"])
+
+        if self.max_requests is not None and len(self.records) > self.max_requests:
+            self.records = self.records[:self.max_requests]
+            # 重建 chat_dict 和 children_dict 以匹配截断后的 records
+            self.chat_dict.clear()
+            self.children_dict.clear()
+            for record in self.records:
+                self.chat_dict[record["chat_id"]] = record
+            for record in self.records:
+                parent_id = record["parent_chat_id"]
+                if parent_id != -1:
+                    self.children_dict[parent_id].append(record["chat_id"])
 
         print(f"加载 trace: {len(self.records)} 条记录")
 
@@ -728,6 +742,8 @@ async def main():
                              "消除多轮对话串行依赖对有效 QPS 的限制。")
     parser.add_argument("--max-model-len", type=int, default=0,
                         help="模型 context window 大小。>0 时自动 clamp output tokens 使 input+output <= max_model_len")
+    parser.add_argument("--max-requests", type=int, default=None,
+                        help="只加载 trace 前 N 条记录，用于快速验证")
     args = parser.parse_args()
 
     runner = PrefetchABRunner(
@@ -741,6 +757,7 @@ async def main():
         max_output_tokens=args.max_output_tokens,
         open_loop=args.open_loop,
         max_model_len=args.max_model_len,
+        max_requests=args.max_requests,
     )
     await runner.run(
         num_multi_turn=args.num_multi_turn,

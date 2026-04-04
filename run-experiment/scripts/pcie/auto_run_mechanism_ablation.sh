@@ -174,6 +174,7 @@ shift 2>/dev/null || true
 NUM_GPU_BLOCKS_OVERRIDE_SET=0
 RUN_GROUPS="no-pq,no-ef,no-cc"  # 默认只跑 3 个新消融组
 OPEN_LOOP=0
+MAX_REQUESTS=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -181,6 +182,7 @@ while [[ $# -gt 0 ]]; do
         --lead-time)       PREFETCH_LEAD_TIME="$2"; shift 2 ;;
         --gpu-blocks)      NUM_GPU_BLOCKS_OVERRIDE="$2"; NUM_GPU_BLOCKS_OVERRIDE_SET=1; shift 2 ;;
         --open-loop)       OPEN_LOOP=1; shift ;;
+        --max-requests)    MAX_REQUESTS="$2"; shift 2 ;;
         --groups)
             _g="$(echo "$2" | tr '[:upper:]' '[:lower:]')"
             if [[ "$_g" == "all" ]]; then
@@ -344,6 +346,9 @@ run_phase() {
     OPEN_LOOP_ARGS=()
     [[ "${OPEN_LOOP:-0}" -eq 1 ]] && OPEN_LOOP_ARGS=(--open-loop)
 
+    MAX_REQUESTS_ARGS=()
+    [[ -n "$MAX_REQUESTS" ]] && MAX_REQUESTS_ARGS=(--max-requests "$MAX_REQUESTS")
+
     local run_status=0
     python3 prefetch_ab_runner.py \
         --trace-file "$TRACE" \
@@ -359,6 +364,7 @@ run_phase() {
         --prefetch-lead-time "$PREFETCH_LEAD_TIME" \
         --schedule-mode "$SCHEDULE_MODE" \
         "${OPEN_LOOP_ARGS[@]}" \
+        "${MAX_REQUESTS_ARGS[@]}" \
         2>&1 | tee "$RESULTS_DIR/prefetch_${SUFFIX}.log" || run_status=$?
 
     if [[ $run_status -ne 0 ]]; then
