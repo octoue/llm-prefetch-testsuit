@@ -42,7 +42,7 @@ start_vllm() {
     fi
 
     local startup_log="$RESULTS_DIR/vllm_startup_${label}.log"
-    nohup bash "$RUN_EXP_DIR/start_vllm_pcie.sh" "${args[@]}" > "$startup_log" 2>&1 &
+    bash "$RUN_EXP_DIR/start_vllm_pcie.sh" "${args[@]}" > "$startup_log" 2>&1 &
     VLLM_PID=$!
     echo "vLLM PID: $VLLM_PID  (log: $startup_log)"
 
@@ -107,6 +107,8 @@ stop_vllm() {
 }
 
 cleanup() {
+    # 所有输出走 stderr，防止 stdout 管道断裂时 SIGPIPE 中断清理
+    exec 1>&2 2>/dev/null
     echo ""
     echo "Cleaning up..."
     stop_vllm

@@ -62,7 +62,7 @@ start_vllm() {
     fi
 
     local startup_log="$RESULTS_DIR/vllm_startup_${label}.log"
-    nohup bash "$SCRIPT_DIR/start_vllm_prefetch.sh" \
+    bash "$SCRIPT_DIR/start_vllm_prefetch.sh" \
         --gpu-blocks "$NUM_GPU_BLOCKS_OVERRIDE" \
         --log-file "$RESULTS_DIR/vllm_log_${label}.log" \
         "${extra_args[@]}" \
@@ -123,6 +123,8 @@ stop_vllm() {
 }
 
 cleanup() {
+    # 所有输出走 stderr，防止 stdout 管道断裂时 SIGPIPE 中断清理
+    exec 1>&2 2>/dev/null
     echo ""
     echo "Cleaning up (PID $$)..."
     stop_vllm

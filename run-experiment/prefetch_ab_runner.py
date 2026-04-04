@@ -104,11 +104,13 @@ class PrefetchABRunner:
         self._prefetch_cached_list: List[int] = []
 
     def _clamp_output_tokens(self, output_tokens: int, input_tokens: int) -> int:
-        """Clamp output tokens: 先应用 max_output_tokens，再确保不超 context window。"""
+        """Clamp output tokens: 先应用 max_output_tokens，再确保不超 context window。
+        预留 256 tokens 余量给 chat template / special tokens 等开销。"""
         if self.max_output_tokens is not None:
             output_tokens = min(output_tokens, self.max_output_tokens)
         if self.max_model_len > 0:
-            max_allowed = self.max_model_len - input_tokens
+            reserved = 512
+            max_allowed = self.max_model_len - input_tokens - reserved
             if output_tokens > max_allowed:
                 output_tokens = max(self._min_output_tokens, max_allowed)
         return output_tokens
