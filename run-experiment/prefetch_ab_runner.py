@@ -51,6 +51,7 @@ class PrefetchABRunner:
         request_timeout: Optional[float] = None,
         max_output_tokens: Optional[int] = None,
         open_loop: bool = False,
+        max_model_len: int = 0,
     ):
         self.trace_file = trace_file
         self.api_base = api_base
@@ -61,6 +62,10 @@ class PrefetchABRunner:
         self.request_timeout = request_timeout  # 仅轻量化测试使用，None 时保持 OpenAI 默认 600s
         self.max_output_tokens = max_output_tokens  # 限制单请求最大生成 token 数
         self.open_loop = open_loop  # Open-loop: 每个请求按计划时间独立发送，不等前一轮完成
+        self.max_model_len = max_model_len  # 模型 context window 大小，>0 时自动 clamp output tokens
+
+        # 最小生成 token 数 (避免 clamp 到 0)
+        self._min_output_tokens = 16
 
         # 在 seed 设置后生成单词池，确保两次运行生成完全相同的文本
         random.seed(seed)
@@ -97,6 +102,16 @@ class PrefetchABRunner:
         self._tpot_list: List[float] = []
         self._cached_count = 0
         self._prefetch_cached_list: List[int] = []
+
+    def _clamp_output_tokens(self, output_tokens: int, input_tokens: int) -> int:
+        """Clamp output tokens: 先应用 max_output_tokens，再确保不超 context window。"""
+        if self.max_output_tokens is not None:
+            output_tokens = min(output_tokens, self.max_output_tokens)
+        if self.max_model_len > 0:
+            max_allowed = self.max_model_len - input_tokens
+            if output_tokens > max_allowed:
+                output_tokens = max(self._min_output_tokens, max_allowed)
+        return output_tokens
 
     def _load_trace(self):
         with open(self.trace_file, "r", encoding="utf-8") as f:
@@ -276,9 +291,7 @@ class PrefetchABRunner:
                 )
 
                 # 用 placeholder assistant response 填充历史，供后续轮次使用
-                output_tokens = record["output_length"]
-                if self.max_output_tokens is not None:
-                    output_tokens = min(output_tokens, self.max_output_tokens)
+                output_tokens = self._clamp_output_tokens(record["output_length"], record["input_length"])
                 placeholder = self._generate_text_with_tokens(
                     output_tokens, chat_id=chat_id, turn=turn, placeholder=True
                 )
@@ -424,9 +437,7 @@ class PrefetchABRunner:
             return
 
         # 发送请求
-        output_tokens = record["output_length"]
-        if self.max_output_tokens is not None:
-            output_tokens = min(output_tokens, self.max_output_tokens)
+        output_tokens = self._clamp_output_tokens(record["output_length"], record["input_length"])
         result = await self._send_streaming_request(messages, output_tokens)
 
         # 写日志
@@ -528,9 +539,7 @@ class PrefetchABRunner:
             )
             messages.append({"role": "user", "content": user_msg})
 
-            output_tokens = record["output_length"]
-            if self.max_output_tokens is not None:
-                output_tokens = min(output_tokens, self.max_output_tokens)
+            output_tokens = self._clamp_output_tokens(record["output_length"], record["input_length"])
             result = await self._send_streaming_request(messages, output_tokens)
 
             if result["success"] and result.get("text"):
@@ -715,6 +724,8 @@ async def main():
     parser.add_argument("--open-loop", action="store_true", default=False,
                         help="Open-loop 模式：所有请求按计划时间独立发送，不等待前一轮完成。"
                              "消除多轮对话串行依赖对有效 QPS 的限制。")
+    parser.add_argument("--max-model-len", type=int, default=0,
+                        help="模型 context window 大小。>0 时自动 clamp output tokens 使 input+output <= max_model_len")
     args = parser.parse_args()
 
     runner = PrefetchABRunner(
@@ -727,6 +738,7 @@ async def main():
         request_timeout=args.request_timeout,
         max_output_tokens=args.max_output_tokens,
         open_loop=args.open_loop,
+        max_model_len=args.max_model_len,
     )
     await runner.run(
         num_multi_turn=args.num_multi_turn,

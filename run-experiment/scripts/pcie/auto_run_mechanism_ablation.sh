@@ -72,20 +72,32 @@ start_vllm() {
     return 1
 }
 
+_kill_tree() {
+    local pid="$1"
+    local sig="${2:-TERM}"
+    # 先收集所有子进程，再自底向上杀
+    local children
+    children=$(pgrep -P "$pid" 2>/dev/null) || true
+    for child in $children; do
+        _kill_tree "$child" "$sig"
+    done
+    kill -"$sig" "$pid" 2>/dev/null || true
+}
+
 stop_vllm() {
     if [ -n "$VLLM_PID" ] && kill -0 "$VLLM_PID" 2>/dev/null; then
-        echo "Stopping vLLM (PID: $VLLM_PID)..."
-        kill "$VLLM_PID" 2>/dev/null || true
+        echo "Stopping vLLM (PID: $VLLM_PID) and all child processes..."
+        _kill_tree "$VLLM_PID" TERM
 
         local waited=0
-        while kill -0 "$VLLM_PID" 2>/dev/null && [ $waited -lt 30 ]; do
+        while kill -0 "$VLLM_PID" 2>/dev/null && [ $waited -lt 15 ]; do
             sleep 1
             waited=$((waited + 1))
         done
 
         if kill -0 "$VLLM_PID" 2>/dev/null; then
-            echo "Force killing..."
-            kill -9 "$VLLM_PID" 2>/dev/null || true
+            echo "Force killing process tree..."
+            _kill_tree "$VLLM_PID" 9
         fi
         VLLM_PID=""
     fi
@@ -98,6 +110,14 @@ cleanup() {
     echo ""
     echo "Cleaning up..."
     stop_vllm
+    # 兜底：杀掉本脚本占用端口的残留进程（vLLM worker 可能不在进程树中）
+    local pids
+    pids=$(lsof -ti :"$API_PORT" 2>/dev/null) || true
+    if [[ -n "$pids" ]]; then
+        echo "Killing residual processes on port $API_PORT: $pids"
+        echo "$pids" | xargs kill -9 2>/dev/null || true
+        sleep 2
+    fi
     # 清理子进程遗留的过期 GPU 锁
     source "$RUN_EXP_DIR/scripts/utils/gpu_lock.sh" 2>/dev/null && _clean_stale_locks 2>/dev/null || true
 }
