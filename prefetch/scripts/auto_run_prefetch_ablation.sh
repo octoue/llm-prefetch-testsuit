@@ -260,6 +260,7 @@ run_experiment() {
         --seed "$SEED" \
         --prefetch-lead-time "$LEAD_TIME_VAL" \
         --schedule-mode "$SCHEDULE_MODE" \
+        --open-loop \
         "${RUNNER_TIMEOUT_ARGS[@]}" \
         "${MAX_OUTPUT_ARGS[@]}" \
         2>&1 | tee "$RESULTS_DIR/${SUFFIX}.log"
