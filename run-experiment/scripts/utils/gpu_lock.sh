@@ -26,7 +26,8 @@ _init_lock_dir() {
 
 # 清理 PID 已不存在的过期锁
 _clean_stale_locks() {
-    for lockfile in "$GPU_LOCK_DIR"/gpu_*.lock 2>/dev/null; do
+    local _lockfiles=("$GPU_LOCK_DIR"/gpu_*.lock)
+    for lockfile in "${_lockfiles[@]}"; do
         [[ -f "$lockfile" ]] || continue
         local lock_pid
         lock_pid=$(cat "$lockfile" 2>/dev/null | head -1)
@@ -40,7 +41,8 @@ _clean_stale_locks() {
 _get_locked_gpus() {
     _clean_stale_locks
     local locked=()
-    for lockfile in "$GPU_LOCK_DIR"/gpu_*.lock 2>/dev/null; do
+    local _lockfiles=("$GPU_LOCK_DIR"/gpu_*.lock)
+    for lockfile in "${_lockfiles[@]}"; do
         [[ -f "$lockfile" ]] || continue
         local idx
         idx=$(basename "$lockfile" .lock | sed 's/gpu_//')
