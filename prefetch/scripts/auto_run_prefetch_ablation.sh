@@ -8,12 +8,13 @@
 #   C) 配额比例消融 (max_prefetch_block_ratio)
 #   D) Prefetch 提前量消融 (prefetch_lead_time)
 #   E) QPS 负载敏感性
+#   F) GPU Blocks 扫描 (制造缓存压力, baseline+prefetch)
 #
 # 用法:
 #   ./auto_run_prefetch_ablation.sh [dataset] [options]
 #   ./auto_run_prefetch_ablation.sh optimal --groups A,B
 #   ./auto_run_prefetch_ablation.sh optimal --groups D --qps 1.0
-#   ./auto_run_prefetch_ablation.sh optimal --groups A,B,C,D,E
+#   ./auto_run_prefetch_ablation.sh optimal --groups A,B,C,D,E,F
 #
 # 选项:
 #   --qps N              默认 QPS (用于非 E 组实验, default: 0.5)
@@ -144,7 +145,7 @@ while [[ $# -gt 0 ]]; do
         --groups)      RUN_GROUPS="$(echo "$2" | tr '[:lower:]' '[:upper:]')"; shift 2 ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [dataset] [--qps N] [--lead-time N] [--gpu-blocks N] [--groups A,B,C,D,E]"
+            echo "Usage: $0 [dataset] [--qps N] [--lead-time N] [--gpu-blocks N] [--groups A,B,C,D,E,F]"
             exit 1 ;;
     esac
 done
@@ -386,6 +387,37 @@ if should_run E; then
 fi
 
 # ============================================================
+# Group F: GPU Blocks 扫描 (制造缓存压力)
+# 固定 QPS, lead_time, threshold=150, ratio=0.3; 扫描 GPU blocks
+# 每个配置跑 baseline + prefetch, 需要重启 vLLM
+# ============================================================
+
+if should_run F; then
+    print_phase "[Group F] GPU Blocks Sweep (Cache Pressure)"
+
+    for GPU_BLK in 100 150 200 300 500; do
+        if ! start_vllm "F_blk${GPU_BLK}" \
+            --gpu-blocks "$GPU_BLK" \
+            --prefetch-block-threshold 150 \
+            --max-prefetch-block-ratio 0.3; then
+            record_skip "[Group F] gpu_blocks=${GPU_BLK} vLLM 启动失败"
+            stop_vllm
+            continue
+        fi
+
+        run_experiment "F-blk${GPU_BLK}-baseline" "baseline" "$DEFAULT_QPS" "$DEFAULT_LEAD_TIME" \
+            "F_blk${GPU_BLK}_baseline_q${DEFAULT_QPS}" \
+            || record_skip "[Group F] gpu_blocks=${GPU_BLK} baseline 实验失败"
+
+        run_experiment "F-blk${GPU_BLK}-prefetch" "prefetch" "$DEFAULT_QPS" "$DEFAULT_LEAD_TIME" \
+            "F_blk${GPU_BLK}_prefetch_q${DEFAULT_QPS}" \
+            || record_skip "[Group F] gpu_blocks=${GPU_BLK} prefetch 实验失败"
+
+        stop_vllm
+    done
+fi
+
+# ============================================================
 # 生成汇总报告
 # ============================================================
 
@@ -399,7 +431,7 @@ REPORT="$RESULTS_DIR/ablation_report.md"
     echo "**Dataset**: $DATASET | **Model**: $MODEL_TAG | **GPU Blocks**: $NUM_GPU_BLOCKS_OVERRIDE"
     echo ""
 
-    for GROUP_PREFIX in A B C D E; do
+    for GROUP_PREFIX in A B C D E F; do
         FILES=("$RESULTS_DIR"/${GROUP_PREFIX}_*.jsonl)
         [[ ! -f "${FILES[0]}" ]] && continue
 
