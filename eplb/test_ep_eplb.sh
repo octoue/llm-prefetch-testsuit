@@ -8,7 +8,7 @@ set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 API_PORT="${API_PORT:-8000}"
-MODEL_PATH="${MODEL_PATH:-deepseek-ai/DeepSeek-V2-Lite-Chat}"
+MODEL_PATH="${MODEL_PATH:-/lpai/models/deepseek-ai__deepseek-v2-lite-chat/24-05-17-0658}"
 NUM_REQUESTS=200
 STEP_INTERVAL=100  # 调低 step_interval 以更容易触发 rearrangement
 

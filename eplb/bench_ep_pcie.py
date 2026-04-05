@@ -234,7 +234,7 @@ def print_stats(results: list[RequestResult], output_path: str | None = None):
 def main():
     parser = argparse.ArgumentParser(description="EP + PCIe Benchmark")
     parser.add_argument("--api-base", default="http://localhost:8000/v1")
-    parser.add_argument("--model", default="deepseek-ai/DeepSeek-V2-Lite-Chat")
+    parser.add_argument("--model", default="/lpai/models/deepseek-ai__deepseek-v2-lite-chat/24-05-17-0658")
     parser.add_argument("--qps", type=float, default=1.0)
     parser.add_argument("--num-requests", type=int, default=100)
     parser.add_argument("--max-tokens", type=int, default=128)

@@ -43,5 +43,5 @@ then explore whether PCIe scheduling can coordinate prefetch/KV transfers with E
 ./test_ep_eplb.sh
 
 # 3. Benchmark EP + PCIe
-python3 bench_ep_pcie.py --api-base http://localhost:8000/v1 --model deepseek-ai/DeepSeek-V2-Lite-Chat --qps 1.0 --num-requests 100
+python3 bench_ep_pcie.py --api-base http://localhost:8000/v1 --qps 1.0 --num-requests 100
 ```

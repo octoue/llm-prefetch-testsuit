@@ -13,7 +13,7 @@ RUN_EXP_DIR="$(cd "$SCRIPT_DIR/../run-experiment" && pwd)"
 # ============================================================
 # Defaults
 # ============================================================
-MODEL_PATH="${MODEL_PATH:-deepseek-ai/DeepSeek-V2-Lite-Chat}"
+MODEL_PATH="${MODEL_PATH:-/lpai/models/deepseek-ai__deepseek-v2-lite-chat/24-05-17-0658}"
 EP_SIZE=2
 ENABLE_EPLB=0
 API_PORT="${API_PORT:-8000}"
@@ -108,7 +108,7 @@ if [[ -n "$LOG_FILE" ]]; then
     [[ "$LOG_FILE" != /* ]] && LOG_FILE="$(pwd)/$LOG_FILE"
     mkdir -p "$(dirname "$LOG_FILE")"
     echo "Log: $LOG_FILE"
-    VLLM_TEST_ENABLE_EP=1 vllm serve "${CMD_ARGS[@]}" 2>&1 | tee "$LOG_FILE"
+    VLLM_TEST_ENABLE_EP=1 HF_HUB_OFFLINE=1 vllm serve "${CMD_ARGS[@]}" 2>&1 | tee "$LOG_FILE"
 else
-    VLLM_TEST_ENABLE_EP=1 vllm serve "${CMD_ARGS[@]}" 2>&1
+    VLLM_TEST_ENABLE_EP=1 HF_HUB_OFFLINE=1 vllm serve "${CMD_ARGS[@]}" 2>&1
 fi
