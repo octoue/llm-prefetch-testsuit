@@ -678,7 +678,7 @@ else:
         echo "Report: $ABLATION_MD"
 
         # 追加到机制消融专用 TSV
-        MECH_ABLATION_TABLE_TSV="$REPO_ROOT/results/pcie_mechanism_ablation_experiments.txt"
+        MECH_ABLATION_TABLE_TSV="$REPO_ROOT/results/pcie_data.txt"
         if [[ -f "../result-analysis/append_pcie_mechanism_ablation_summary_row.py" ]]; then
             python3 ../result-analysis/append_pcie_mechanism_ablation_summary_row.py \
                 --results-dir "$RESULTS_DIR" \
