@@ -1,0 +1,383 @@
+#!/bin/bash
+# EP + EPLB + KV Offloading + Prefetch 联合测试
+#
+# 目的: 用多轮对话 workload 同时产生以下 5 种 PCIe 流量,
+#       测量它们在 PCIe-only 环境下的竞争对 TTFT 的影响:
+#       1. EP all-to-all (forward 时 expert 通信)
+#       2. EPLB P2P (expert 权重迁移, ~1s 同步阻塞)
+#       3. Prefetch H2D (预取 KV cache)
+#       4. Restore H2D (恢复被 evict 的 KV cache)
+#       5. Evict D2H (驱逐 KV cache 到 CPU)
+#
+# 实验组:
+#   G0: EP + Offload (baseline, 无 prefetch, 无 EPLB)
+#   G1: EP + Offload + Prefetch (有 prefetch, 无 EPLB)
+#   G2: EP + Offload + EPLB (无 prefetch, 有 EPLB)
+#   G3: EP + Offload + Prefetch + EPLB (全部开启)
+#
+# 用法:
+#   ./test_ep_prefetch.sh [options]
+#
+# 选项:
+#   --model PATH         模型路径
+#   --port PORT          API 端口 (default: 8000)
+#   --qps QPS            请求速率 (default: 1.0)
+#   --dataset NAME       数据集: lite / pcie-heavy (default: lite)
+#   --groups GROUPS      运行的组, 逗号分隔或 'all' (default: all)
+#   --step-interval N    EPLB step interval (default: 100)
+
+set -eo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+RUN_EXP_DIR="$REPO_ROOT/run-experiment"
+DATA_DIR="$REPO_ROOT/data"
+
+# ============================================================
+# Defaults
+# ============================================================
+MODEL_PATH="${MODEL_PATH:-/lpai/models/deepseek-ai__deepseek-v2-lite-chat/24-05-17-0658}"
+API_PORT="${API_PORT:-8000}"
+QPS=1.0
+DATASET="lite"
+RUN_GROUPS="all"
+EPLB_STEP_INTERVAL=100
+EP_SIZE=2
+GPU_MEM_UTIL=0.7
+MAX_NUM_SEQS=32
+MAX_MODEL_LEN=4096
+KV_OFFLOADING_SIZE=10
+PREFETCH_LEAD_TIME=2.0
+REQUEST_TIMEOUT=360
+
+# ============================================================
+# Parse args
+# ============================================================
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --model)         MODEL_PATH="$2";         shift 2 ;;
+        --port)          API_PORT="$2";            shift 2 ;;
+        --qps)           QPS="$2";                 shift 2 ;;
+        --dataset)       DATASET="$2";             shift 2 ;;
+        --groups)        RUN_GROUPS="$2";           shift 2 ;;
+        --step-interval) EPLB_STEP_INTERVAL="$2";  shift 2 ;;
+        --ep-size)       EP_SIZE="$2";             shift 2 ;;
+        --gpu-mem-util)  GPU_MEM_UTIL="$2";        shift 2 ;;
+        --lead-time)     PREFETCH_LEAD_TIME="$2";  shift 2 ;;
+        -h|--help)
+            sed -n '2,/^$/p' "$0" | grep '^#' | sed 's/^# \?//'
+            exit 0 ;;
+        *) echo "Unknown: $1"; exit 1 ;;
+    esac
+done
+
+# ============================================================
+# Dataset config
+# ============================================================
+case "$DATASET" in
+    lite)
+        TRACE_FILE="$DATA_DIR/lite_dataset.jsonl"
+        NUM_CONV=18
+        ;;
+    pcie-heavy)
+        TRACE_FILE="$DATA_DIR/pcie_stress_heavy.jsonl"
+        NUM_CONV=40
+        ;;
+    *)
+        # Assume it's a direct path
+        TRACE_FILE="$DATASET"
+        NUM_CONV=20
+        ;;
+esac
+
+if [[ ! -f "$TRACE_FILE" ]]; then
+    echo "Error: trace file not found: $TRACE_FILE"
+    exit 1
+fi
+
+API_BASE="http://localhost:$API_PORT"
+RESULTS_DIR="$SCRIPT_DIR/results/ep_prefetch_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$RESULTS_DIR"
+PIDFILE="/tmp/vllm_ep_${API_PORT}.pid"
+
+should_run_group() {
+    [[ "$RUN_GROUPS" == "all" ]] || [[ ",$RUN_GROUPS," == *",$1,"* ]]
+}
+
+# ============================================================
+# Cleanup
+# ============================================================
+cleanup() {
+    echo ""
+    echo "Cleaning up..."
+
+    if [[ -f "$PIDFILE" ]]; then
+        local pid
+        pid=$(cat "$PIDFILE" 2>/dev/null)
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            echo "Killing vLLM (PID: $pid)..."
+            kill "$pid" 2>/dev/null || true
+            sleep 3
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        rm -f "$PIDFILE"
+    fi
+
+    local port_pids
+    port_pids=$(lsof -ti :"$API_PORT" 2>/dev/null) || true
+    if [[ -n "$port_pids" ]]; then
+        echo "Killing residual processes on port $API_PORT"
+        echo "$port_pids" | xargs kill -9 2>/dev/null || true
+    fi
+
+    sleep 2
+    echo "Cleanup done."
+}
+trap cleanup EXIT INT TERM
+
+# ============================================================
+# vLLM start/stop helpers
+# ============================================================
+start_vllm() {
+    local label="$1"
+    local enable_eplb="$2"     # 0 or 1
+
+    echo ""
+    echo "========================================"
+    echo "Starting vLLM [$label]"
+    echo "  EP=$EP_SIZE, EPLB=$([ "$enable_eplb" -eq 1 ] && echo ON || echo OFF)"
+    echo "  Offloading=${KV_OFFLOADING_SIZE}GiB, gpu_mem_util=$GPU_MEM_UTIL"
+    echo "========================================"
+
+    # Kill any previous instance
+    if [[ -f "$PIDFILE" ]]; then
+        local old_pid
+        old_pid=$(cat "$PIDFILE" 2>/dev/null)
+        if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+            kill "$old_pid" 2>/dev/null || true
+            sleep 3
+            kill -9 "$old_pid" 2>/dev/null || true
+        fi
+        rm -f "$PIDFILE"
+    fi
+    # Also clean port
+    lsof -ti :"$API_PORT" 2>/dev/null | xargs kill -9 2>/dev/null || true
+    sleep 2
+
+    local CMD_ARGS=(
+        --model "$MODEL_PATH"
+        --host 0.0.0.0
+        --port "$API_PORT"
+        --dtype float16
+        --tensor-parallel-size "$EP_SIZE"
+        --gpu-memory-utilization "$GPU_MEM_UTIL"
+        --max-num-seqs "$MAX_NUM_SEQS"
+        --max-model-len "$MAX_MODEL_LEN"
+        --trust-remote-code
+        --enforce-eager
+        --enable-expert-parallel
+        --kv-offloading-size "$KV_OFFLOADING_SIZE"
+        --kv-offloading-backend native
+        --swap-space 256
+        --enable-prefix-caching
+        --disable-hybrid-kv-cache-manager
+    )
+
+    if [[ "$enable_eplb" -eq 1 ]]; then
+        CMD_ARGS+=(
+            --enable-eplb
+            --eplb-config "{\"step_interval\": $EPLB_STEP_INTERVAL, \"num_redundant_experts\": 0}"
+        )
+    fi
+
+    NCCL_P2P_DISABLE=1 NCCL_NVLS_ENABLE=0 VLLM_TEST_ENABLE_EP=1 HF_HUB_OFFLINE=1 \
+        vllm serve "${CMD_ARGS[@]}" > "$RESULTS_DIR/vllm_${label}.log" 2>&1 &
+    local vllm_pid=$!
+    echo "$vllm_pid" > "$PIDFILE"
+    echo "vLLM PID: $vllm_pid"
+
+    # Wait for ready
+    local max_wait=300
+    local waited=0
+    echo -n "Waiting for server"
+    while [[ $waited -lt $max_wait ]]; do
+        if curl -s "$API_BASE/health" &>/dev/null; then
+            echo ""
+            echo "Server ready (${waited}s)"
+            sleep 5
+            return 0
+        fi
+        if ! kill -0 "$vllm_pid" 2>/dev/null; then
+            echo ""
+            echo "Server died. Check: $RESULTS_DIR/vllm_${label}.log"
+            return 1
+        fi
+        echo -n "."
+        sleep 3
+        waited=$((waited + 3))
+    done
+    echo ""
+    echo "Timeout waiting for server"
+    return 1
+}
+
+stop_vllm() {
+    if [[ -f "$PIDFILE" ]]; then
+        local pid
+        pid=$(cat "$PIDFILE" 2>/dev/null)
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            echo "Stopping vLLM (PID: $pid)..."
+            kill "$pid" 2>/dev/null || true
+            local waited=0
+            while kill -0 "$pid" 2>/dev/null && [[ $waited -lt 15 ]]; do
+                sleep 1
+                waited=$((waited + 1))
+            done
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        rm -f "$PIDFILE"
+    fi
+    lsof -ti :"$API_PORT" 2>/dev/null | xargs kill -9 2>/dev/null || true
+    sleep 3
+    echo "vLLM stopped."
+}
+
+run_workload() {
+    local mode="$1"   # baseline or prefetch
+    local label="$2"
+    local output="$RESULTS_DIR/${label}.jsonl"
+
+    echo ""
+    echo "--- Running [$label] mode=$mode qps=$QPS ---"
+
+    # Reset prefix cache
+    curl -s -X POST "$API_BASE/reset_prefix_cache?reset_external=true" >/dev/null || true
+    sleep 3
+
+    python3 "$RUN_EXP_DIR/prefetch_ab_runner.py" \
+        --trace-file "$TRACE_FILE" \
+        --mode "$mode" \
+        --qps "$QPS" \
+        --num-multi-turn "$NUM_CONV" \
+        --model "$MODEL_PATH" \
+        --api-base "$API_BASE/v1" \
+        --output "$output" \
+        --seed 42 \
+        --request-timeout "$REQUEST_TIMEOUT" \
+        --prefetch-lead-time "$PREFETCH_LEAD_TIME" \
+        --schedule-mode uniform \
+        2>&1 | tee "$RESULTS_DIR/${label}.log"
+
+    echo "Output: $output"
+}
+
+# ============================================================
+# Print overview
+# ============================================================
+echo "========================================"
+echo "EP + Prefetch Contention Test"
+echo "========================================"
+echo "Model:     $MODEL_PATH"
+echo "EP size:   $EP_SIZE"
+echo "Dataset:   $DATASET ($TRACE_FILE)"
+echo "QPS:       $QPS"
+echo "Offload:   ${KV_OFFLOADING_SIZE}GiB"
+echo "Lead time: ${PREFETCH_LEAD_TIME}s"
+echo "EPLB step: $EPLB_STEP_INTERVAL"
+echo "Groups:    $RUN_GROUPS"
+echo "Results:   $RESULTS_DIR"
+echo "========================================"
+
+# ============================================================
+# G0: EP + Offload (baseline, no prefetch, no EPLB)
+# ============================================================
+if should_run_group g0; then
+    start_vllm "g0" 0 || exit 1
+    run_workload "baseline" "g0_baseline"
+    stop_vllm
+fi
+
+# ============================================================
+# G1: EP + Offload + Prefetch (no EPLB)
+# ============================================================
+if should_run_group g1; then
+    start_vllm "g1" 0 || exit 1
+    run_workload "prefetch" "g1_prefetch"
+    stop_vllm
+fi
+
+# ============================================================
+# G2: EP + Offload + EPLB (no prefetch)
+# ============================================================
+if should_run_group g2; then
+    start_vllm "g2" 1 || exit 1
+    run_workload "baseline" "g2_eplb"
+    stop_vllm
+fi
+
+# ============================================================
+# G3: EP + Offload + Prefetch + EPLB (all enabled)
+# ============================================================
+if should_run_group g3; then
+    start_vllm "g3" 1 || exit 1
+    run_workload "prefetch" "g3_prefetch_eplb"
+    stop_vllm
+fi
+
+# ============================================================
+# Generate report
+# ============================================================
+echo ""
+echo "========================================"
+echo "Generating report..."
+echo "========================================"
+
+REPORT="$RESULTS_DIR/report.md"
+{
+    echo "# EP + Prefetch Contention Test Report"
+    echo ""
+    echo "| Config | Model | EP | QPS | Dataset | Offload | EPLB step |"
+    echo "|--------|-------|----|-----|---------|---------|-----------|"
+    echo "| - | $(basename "$MODEL_PATH") | $EP_SIZE | $QPS | $DATASET | ${KV_OFFLOADING_SIZE}GiB | $EPLB_STEP_INTERVAL |"
+    echo ""
+    echo "## TTFT Summary"
+    echo ""
+    echo "| Group | Description | Requests | Mean TTFT | P50 | P95 | P99 | Cache Hit |"
+    echo "|-------|-------------|----------|-----------|-----|-----|-----|-----------|"
+
+    for LABEL in g0_baseline g1_prefetch g2_eplb g3_prefetch_eplb; do
+        JSONL="$RESULTS_DIR/${LABEL}.jsonl"
+        if [[ -f "$JSONL" ]]; then
+            python3 -c "
+import json, sys
+import numpy as np
+
+ttfts, cached_list = [], []
+with open('$JSONL') as f:
+    for line in f:
+        d = json.loads(line)
+        if d.get('ttft_ms') is not None:
+            ttfts.append(d['ttft_ms'])
+        cached = d.get('cached_tokens', 0) or 0
+        prompt = d.get('prompt_tokens', 1) or 1
+        if cached > 0:
+            cached_list.append(cached / prompt)
+
+if not ttfts:
+    print('| $LABEL | - | 0 | - | - | - | - | - |')
+else:
+    arr = np.array(ttfts)
+    hit_rate = f'{np.mean(cached_list)*100:.1f}%' if cached_list else '0%'
+    desc = {'g0_baseline': 'EP+Offload', 'g1_prefetch': 'EP+Offload+Prefetch', 'g2_eplb': 'EP+Offload+EPLB', 'g3_prefetch_eplb': 'EP+Offload+Prefetch+EPLB'}
+    print(f'| $LABEL | {desc.get(\"$LABEL\", \"-\")} | {len(arr)} | {np.mean(arr):.0f} | {np.percentile(arr,50):.0f} | {np.percentile(arr,95):.0f} | {np.percentile(arr,99):.0f} | {hit_rate} |')
+"
+        fi
+    done
+} > "$REPORT"
+
+echo ""
+cat "$REPORT"
+echo ""
+echo "Report: $REPORT"
+echo "Results: $RESULTS_DIR"
+echo "Done."
