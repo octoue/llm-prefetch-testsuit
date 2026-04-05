@@ -37,7 +37,7 @@ MAX_REQUESTS=""
 
 # 模型路径配置（按需修改）
 MODEL_PATH_32B="/lpai/models/Qwen__Qwen3-32B/25-07-26-0345"
-MODEL_PATH_72B=""  # TODO: 填写 72B 模型路径
+MODEL_PATH_72B="/lpai/models/qwen__qwen2_5-72b/24-09-25-1228"  # TODO: 填写 72B 模型路径
 
 # ============================================================
 # 参数解析
