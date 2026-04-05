@@ -19,17 +19,43 @@ done
 API_BASE="http://localhost:$API_PORT"
 RESULTS_DIR="$SCRIPT_DIR/results/basic_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RESULTS_DIR"
+PIDFILE="/tmp/vllm_ep_${API_PORT}.pid"
 
 # ============================================================
-# Cleanup
+# Cleanup: kill vLLM and all its children on exit/Ctrl+C
 # ============================================================
-VLLM_PID=""
 cleanup() {
-    if [[ -n "$VLLM_PID" ]] && kill -0 "$VLLM_PID" 2>/dev/null; then
-        echo "Stopping vLLM (PID: $VLLM_PID)..."
-        kill "$VLLM_PID" 2>/dev/null || true
-        wait "$VLLM_PID" 2>/dev/null || true
+    echo ""
+    echo "Cleaning up..."
+
+    # 1. Kill via PID file (start_vllm_ep.sh writes this)
+    if [[ -f "$PIDFILE" ]]; then
+        local pid
+        pid=$(cat "$PIDFILE" 2>/dev/null)
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            echo "Killing vLLM process tree (PID: $pid)..."
+            # Kill the entire process group
+            kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+        fi
+        rm -f "$PIDFILE"
     fi
+
+    # 2. Kill the background start_vllm_ep.sh if still running
+    if [[ -n "$LAUNCHER_PID" ]] && kill -0 "$LAUNCHER_PID" 2>/dev/null; then
+        kill "$LAUNCHER_PID" 2>/dev/null || true
+        wait "$LAUNCHER_PID" 2>/dev/null || true
+    fi
+
+    # 3. Kill any remaining process on the port
+    local port_pids
+    port_pids=$(lsof -ti :"$API_PORT" 2>/dev/null) || true
+    if [[ -n "$port_pids" ]]; then
+        echo "Killing residual processes on port $API_PORT: $port_pids"
+        echo "$port_pids" | xargs kill -9 2>/dev/null || true
+    fi
+
+    sleep 2
+    echo "Cleanup done."
 }
 trap cleanup EXIT INT TERM
 
@@ -42,9 +68,9 @@ bash "$SCRIPT_DIR/start_vllm_ep.sh" \
     --ep-size 2 \
     --port "$API_PORT" \
     --log-file "$RESULTS_DIR/vllm.log" &
-VLLM_PID=$!
+LAUNCHER_PID=$!
 
-echo "Waiting for server (PID: $VLLM_PID)..."
+echo "Waiting for server (launcher PID: $LAUNCHER_PID)..."
 MAX_WAIT=300
 WAITED=0
 while [[ $WAITED -lt $MAX_WAIT ]]; do
@@ -52,7 +78,7 @@ while [[ $WAITED -lt $MAX_WAIT ]]; do
         echo "Server ready (${WAITED}s)"
         break
     fi
-    if ! kill -0 "$VLLM_PID" 2>/dev/null; then
+    if ! kill -0 "$LAUNCHER_PID" 2>/dev/null; then
         echo "Server died. Check $RESULTS_DIR/vllm.log"
         exit 1
     fi
@@ -92,7 +118,7 @@ else:
 echo "$RESP" > "$RESULTS_DIR/test1_single.json"
 
 # ============================================================
-# Test 2: Concurrent requests (验证 EP all-to-all 在并发下正常)
+# Test 2: Concurrent requests
 # ============================================================
 echo ""
 echo "=== Test 2: 5 concurrent requests ==="
@@ -121,7 +147,7 @@ else
 fi
 
 # ============================================================
-# Test 3: Multi-turn (验证 prefix cache + EP)
+# Test 3: Multi-turn
 # ============================================================
 echo ""
 echo "=== Test 3: Multi-turn conversation ==="
@@ -136,13 +162,15 @@ TURN1=$(curl -s "$API_BASE/v1/chat/completions" \
         "temperature": 0
     }')
 
+ASSISTANT_MSG=$(echo "$TURN1" | python3 -c "import json,sys; print(json.load(sys.stdin)['choices'][0]['message']['content'][:200])" 2>/dev/null || echo "OK")
+
 TURN2=$(curl -s "$API_BASE/v1/chat/completions" \
     -H "Content-Type: application/json" \
     -d '{
         "model": "'"$MODEL_PATH"'",
         "messages": [
             {"role": "user", "content": "My name is Alice. Remember it."},
-            {"role": "assistant", "content": "'"$(echo "$TURN1" | python3 -c "import json,sys; print(json.load(sys.stdin)['choices'][0]['message']['content'][:200])" 2>/dev/null || echo "OK")"'"},
+            {"role": "assistant", "content": "'"${ASSISTANT_MSG//\"/\\\"}"'"},
             {"role": "user", "content": "What is my name?"}
         ],
         "max_tokens": 64,
@@ -156,8 +184,9 @@ if 'choices' in r:
     content = r['choices'][0]['message']['content']
     print(f'  Turn 2 reply: {content[:100]}')
     prompt_tokens = r.get('usage', {}).get('prompt_tokens_details', {})
-    cached = prompt_tokens.get('cached_tokens', 0)
-    print(f'  Cached tokens: {cached}')
+    if prompt_tokens:
+        cached = prompt_tokens.get('cached_tokens', 0)
+        print(f'  Cached tokens: {cached}')
 else:
     print(f'  FAIL: {r}')
 " 2>/dev/null || echo "  Parse error (non-fatal)"
@@ -171,3 +200,4 @@ echo ""
 echo "=== EP Smoke Test Complete ==="
 echo "Results: $RESULTS_DIR"
 echo "Server log: $RESULTS_DIR/vllm.log"
+# cleanup() runs automatically via trap

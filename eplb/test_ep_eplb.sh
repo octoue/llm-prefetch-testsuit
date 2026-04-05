@@ -25,17 +25,39 @@ done
 API_BASE="http://localhost:$API_PORT"
 RESULTS_DIR="$SCRIPT_DIR/results/eplb_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RESULTS_DIR"
+PIDFILE="/tmp/vllm_ep_${API_PORT}.pid"
 
 # ============================================================
-# Cleanup
+# Cleanup: kill vLLM and all its children on exit/Ctrl+C
 # ============================================================
-VLLM_PID=""
 cleanup() {
-    if [[ -n "$VLLM_PID" ]] && kill -0 "$VLLM_PID" 2>/dev/null; then
-        echo "Stopping vLLM (PID: $VLLM_PID)..."
-        kill "$VLLM_PID" 2>/dev/null || true
-        wait "$VLLM_PID" 2>/dev/null || true
+    echo ""
+    echo "Cleaning up..."
+
+    if [[ -f "$PIDFILE" ]]; then
+        local pid
+        pid=$(cat "$PIDFILE" 2>/dev/null)
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            echo "Killing vLLM process tree (PID: $pid)..."
+            kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+        fi
+        rm -f "$PIDFILE"
     fi
+
+    if [[ -n "$LAUNCHER_PID" ]] && kill -0 "$LAUNCHER_PID" 2>/dev/null; then
+        kill "$LAUNCHER_PID" 2>/dev/null || true
+        wait "$LAUNCHER_PID" 2>/dev/null || true
+    fi
+
+    local port_pids
+    port_pids=$(lsof -ti :"$API_PORT" 2>/dev/null) || true
+    if [[ -n "$port_pids" ]]; then
+        echo "Killing residual processes on port $API_PORT: $port_pids"
+        echo "$port_pids" | xargs kill -9 2>/dev/null || true
+    fi
+
+    sleep 2
+    echo "Cleanup done."
 }
 trap cleanup EXIT INT TERM
 
@@ -52,9 +74,9 @@ bash "$SCRIPT_DIR/start_vllm_ep.sh" \
     --step-interval "$STEP_INTERVAL" \
     --port "$API_PORT" \
     --log-file "$RESULTS_DIR/vllm.log" &
-VLLM_PID=$!
+LAUNCHER_PID=$!
 
-echo "Waiting for server (PID: $VLLM_PID)..."
+echo "Waiting for server (launcher PID: $LAUNCHER_PID)..."
 MAX_WAIT=300
 WAITED=0
 while [[ $WAITED -lt $MAX_WAIT ]]; do
@@ -62,7 +84,7 @@ while [[ $WAITED -lt $MAX_WAIT ]]; do
         echo "Server ready (${WAITED}s)"
         break
     fi
-    if ! kill -0 "$VLLM_PID" 2>/dev/null; then
+    if ! kill -0 "$LAUNCHER_PID" 2>/dev/null; then
         echo "Server died. Check $RESULTS_DIR/vllm.log"
         exit 1
     fi
@@ -151,3 +173,4 @@ echo ""
 echo "Manual check:"
 echo "  grep -i 'rearrange' $RESULTS_DIR/vllm.log"
 echo "  grep -i 'P2P' $RESULTS_DIR/vllm.log"
+# cleanup() runs automatically via trap
