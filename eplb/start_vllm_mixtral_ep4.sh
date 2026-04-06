@@ -151,9 +151,9 @@ if [[ -n "$LOG_FILE" ]]; then
     [[ "$LOG_FILE" != /* ]] && LOG_FILE="$(pwd)/$LOG_FILE"
     mkdir -p "$(dirname "$LOG_FILE")"
     echo "Log: $LOG_FILE"
-    setsid VLLM_TEST_ENABLE_EP=1 HF_HUB_OFFLINE=1 vllm serve "${CMD_ARGS[@]}" > "$LOG_FILE" 2>&1 &
+    setsid env VLLM_TEST_ENABLE_EP=1 HF_HUB_OFFLINE=1 vllm serve "${CMD_ARGS[@]}" > "$LOG_FILE" 2>&1 &
 else
-    setsid VLLM_TEST_ENABLE_EP=1 HF_HUB_OFFLINE=1 vllm serve "${CMD_ARGS[@]}" &
+    setsid env VLLM_TEST_ENABLE_EP=1 HF_HUB_OFFLINE=1 vllm serve "${CMD_ARGS[@]}" &
 fi
 
 VLLM_PID=$!

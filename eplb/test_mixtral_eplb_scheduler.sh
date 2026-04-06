@@ -222,15 +222,15 @@ start_vllm() {
         )
     fi
 
-    local ENV_VARS="NCCL_P2P_DISABLE=1 NCCL_NVLS_ENABLE=0 VLLM_TEST_ENABLE_EP=1 HF_HUB_OFFLINE=1"
+    local ENV_ARGS="NCCL_P2P_DISABLE=1 NCCL_NVLS_ENABLE=0 VLLM_TEST_ENABLE_EP=1 HF_HUB_OFFLINE=1"
     if [[ "$enable_pcie_sched" -eq 1 ]]; then
-        ENV_VARS="$ENV_VARS VLLM_PCIE_SCHEDULER=1"
+        ENV_ARGS="$ENV_ARGS VLLM_PCIE_SCHEDULER=1"
     fi
     if [[ "$enable_eplb_phase" -eq 1 ]]; then
-        ENV_VARS="$ENV_VARS VLLM_EPLB_PHASE_AWARE=1"
+        ENV_ARGS="$ENV_ARGS VLLM_EPLB_PHASE_AWARE=1"
     fi
 
-    eval "setsid $ENV_VARS vllm serve ${CMD_ARGS[*]}" > "$RESULTS_DIR/vllm_${label}.log" 2>&1 &
+    eval "setsid env $ENV_ARGS vllm serve ${CMD_ARGS[*]}" > "$RESULTS_DIR/vllm_${label}.log" 2>&1 &
     local vllm_pid=$!
     # setsid makes the child its own process group leader, PGID = PID
     VLLM_PGID=$vllm_pid
