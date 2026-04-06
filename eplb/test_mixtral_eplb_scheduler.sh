@@ -180,7 +180,7 @@ start_vllm() {
         --enable-expert-parallel
         --kv-offloading-size "$KV_OFFLOADING_SIZE"
         --kv-offloading-backend native
-        --swap-space 256
+        --swap-space 64
         --enable-prefix-caching
         --disable-hybrid-kv-cache-manager
     )
