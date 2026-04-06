@@ -222,15 +222,17 @@ start_vllm() {
         )
     fi
 
-    local ENV_ARGS="NCCL_P2P_DISABLE=1 NCCL_NVLS_ENABLE=0 VLLM_TEST_ENABLE_EP=1 HF_HUB_OFFLINE=1"
+    # Set env vars via export (avoids eval quoting issues with JSON args)
+    export NCCL_P2P_DISABLE=1 NCCL_NVLS_ENABLE=0 VLLM_TEST_ENABLE_EP=1 HF_HUB_OFFLINE=1
+    unset VLLM_PCIE_SCHEDULER VLLM_EPLB_PHASE_AWARE
     if [[ "$enable_pcie_sched" -eq 1 ]]; then
-        ENV_ARGS="$ENV_ARGS VLLM_PCIE_SCHEDULER=1"
+        export VLLM_PCIE_SCHEDULER=1
     fi
     if [[ "$enable_eplb_phase" -eq 1 ]]; then
-        ENV_ARGS="$ENV_ARGS VLLM_EPLB_PHASE_AWARE=1"
+        export VLLM_EPLB_PHASE_AWARE=1
     fi
 
-    eval "setsid env $ENV_ARGS vllm serve ${CMD_ARGS[*]}" > "$RESULTS_DIR/vllm_${label}.log" 2>&1 &
+    setsid vllm serve "${CMD_ARGS[@]}" > "$RESULTS_DIR/vllm_${label}.log" 2>&1 &
     local vllm_pid=$!
     # setsid makes the child its own process group leader, PGID = PID
     VLLM_PGID=$vllm_pid
@@ -251,6 +253,8 @@ start_vllm() {
         if ! kill -0 "$vllm_pid" 2>/dev/null; then
             echo ""
             echo "Server died. Check: $RESULTS_DIR/vllm_${label}.log"
+            # Workers may still be alive holding GPU — clean up now
+            stop_our_vllm
             return 1
         fi
         echo -n "."
