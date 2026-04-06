@@ -113,60 +113,65 @@ should_run_group() {
 }
 
 # ============================================================
-# Robust cleanup: kill vLLM process tree + release GPU
+# Robust cleanup: kill vLLM + all workers + release GPU
 # ============================================================
-kill_process_tree() {
-    local pid="$1"
-    # Find all descendants (children, grandchildren, etc.)
-    local children
-    children=$(pgrep -P "$pid" 2>/dev/null) || true
-    for child in $children; do
-        kill_process_tree "$child"
-    done
-    kill -9 "$pid" 2>/dev/null || true
-}
+# vLLM multiproc executor spawns workers via multiprocessing
+# (start_method='spawn'), so workers are NOT children of the
+# main process. We must find them by cmdline pattern and also
+# check nvidia-smi for any GPU-holding processes.
+# ============================================================
 
 stop_all_vllm() {
     echo ""
     echo "Cleaning up vLLM processes..."
 
-    # 1) Kill by PID file (main process + entire tree)
+    # 1) Graceful TERM to main PID (gives vLLM a chance to shut down workers)
     if [[ -f "$PIDFILE" ]]; then
         local pid
         pid=$(cat "$PIDFILE" 2>/dev/null)
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-            echo "  Killing process tree rooted at PID $pid..."
-            # Try graceful TERM first
+            echo "  Sending TERM to main PID $pid..."
             kill -TERM "$pid" 2>/dev/null || true
-            sleep 2
-            # Then force-kill entire tree
-            kill_process_tree "$pid"
         fi
         rm -f "$PIDFILE"
     fi
+    sleep 3
 
-    # 2) Kill anything still holding the port
+    # 2) Kill ALL vllm-related processes (main + workers + api server)
+    #    Workers' cmdline contains "vllm" regardless of model name
+    local vllm_pids
+    vllm_pids=$(pgrep -f "vllm.entrypoints|vllm.v1.worker|vllm.v1.engine|vllm.executor|multiproc_executor" 2>/dev/null) || true
+    if [[ -n "$vllm_pids" ]]; then
+        echo "  Killing vllm processes: $(echo $vllm_pids | tr '\n' ' ')"
+        echo "$vllm_pids" | xargs kill -9 2>/dev/null || true
+    fi
+
+    # 3) Kill anything still holding the port
     local port_pids
     port_pids=$(lsof -ti :"$API_PORT" 2>/dev/null) || true
     if [[ -n "$port_pids" ]]; then
-        echo "  Killing remaining processes on port $API_PORT: $port_pids"
+        echo "  Killing remaining processes on port $API_PORT: $(echo $port_pids | tr '\n' ' ')"
         echo "$port_pids" | xargs kill -9 2>/dev/null || true
     fi
 
-    # 3) Kill any orphaned vllm worker processes from our model
-    local orphans
-    orphans=$(pgrep -f "vllm.entrypoints.*--port $API_PORT" 2>/dev/null) || true
-    if [[ -n "$orphans" ]]; then
-        echo "  Killing orphaned vllm entrypoint processes: $orphans"
-        echo "$orphans" | xargs kill -9 2>/dev/null || true
-    fi
-    orphans=$(pgrep -f "vllm.v1.worker.*mixtral" 2>/dev/null) || true
-    if [[ -n "$orphans" ]]; then
-        echo "  Killing orphaned vllm worker processes: $orphans"
-        echo "$orphans" | xargs kill -9 2>/dev/null || true
+    sleep 2
+
+    # 4) Last resort: check nvidia-smi for GPU-holding processes and kill
+    #    any that are python/vllm (skip system processes like Xorg)
+    local gpu_pids
+    gpu_pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sort -u) || true
+    if [[ -n "$gpu_pids" ]]; then
+        for gpid in $gpu_pids; do
+            local cmdline
+            cmdline=$(cat /proc/"$gpid"/cmdline 2>/dev/null | tr '\0' ' ') || true
+            if [[ "$cmdline" == *vllm* ]] || [[ "$cmdline" == *python* ]]; then
+                echo "  Killing GPU process $gpid: ${cmdline:0:80}..."
+                kill -9 "$gpid" 2>/dev/null || true
+            fi
+        done
+        sleep 2
     fi
 
-    sleep 3
     echo "  Cleanup done."
 }
 

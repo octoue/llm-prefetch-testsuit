@@ -160,27 +160,30 @@ VLLM_PID=$!
 echo "$VLLM_PID" > "$PIDFILE"
 echo "vLLM PID: $VLLM_PID (saved to $PIDFILE)"
 
-kill_process_tree() {
-    local pid="$1"
-    local children
-    children=$(pgrep -P "$pid" 2>/dev/null) || true
-    for child in $children; do
-        kill_process_tree "$child"
-    done
-    kill -9 "$pid" 2>/dev/null || true
-}
-
 cleanup_standalone() {
     echo ""
     echo "Stopping vLLM..."
+    # Graceful TERM
     if [[ -n "$VLLM_PID" ]] && kill -0 "$VLLM_PID" 2>/dev/null; then
         kill -TERM "$VLLM_PID" 2>/dev/null || true
-        sleep 2
-        kill_process_tree "$VLLM_PID"
     fi
     rm -f "$PIDFILE"
-    # Kill anything still on the port
+    sleep 3
+    # Kill all vllm processes (workers are independent due to multiprocessing spawn)
+    pgrep -f "vllm.entrypoints|vllm.v1.worker|vllm.v1.engine|vllm.executor|multiproc_executor" 2>/dev/null \
+        | xargs kill -9 2>/dev/null || true
     lsof -ti :"$API_PORT" 2>/dev/null | xargs kill -9 2>/dev/null || true
+    sleep 2
+    # Last resort: kill GPU-holding vllm/python processes
+    local gpu_pids
+    gpu_pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sort -u) || true
+    for gpid in $gpu_pids; do
+        local cmdline
+        cmdline=$(cat /proc/"$gpid"/cmdline 2>/dev/null | tr '\0' ' ') || true
+        if [[ "$cmdline" == *vllm* ]] || [[ "$cmdline" == *python* ]]; then
+            kill -9 "$gpid" 2>/dev/null || true
+        fi
+    done
     echo "Done."
 }
 
