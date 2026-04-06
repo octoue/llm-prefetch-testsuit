@@ -23,7 +23,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ============================================================
 # Defaults — MODEL_PATH 需要手动填写
 # ============================================================
-MODEL_PATH="${MODEL_PATH:-/path/to/mixtral-8x7b}"  # TODO: 填写模型路径
+MODEL_PATH="${MODEL_PATH:-/lpai/models/mistralai__mixtral-8x7b-instruct-v0_1/24-08-19-1318}"
 EP_SIZE=4
 ENABLE_EPLB=0
 ENABLE_PCIE_SCHED=0
@@ -67,8 +67,8 @@ done
 # ============================================================
 # Validate
 # ============================================================
-if [[ "$MODEL_PATH" == "/path/to/mixtral-8x7b" ]]; then
-    echo "Error: 请设置 MODEL_PATH 或使用 --model 参数指定 Mixtral-8x7B 模型路径"
+if [[ ! -d "$MODEL_PATH" ]]; then
+    echo "Error: 模型路径不存在: $MODEL_PATH"
     exit 1
 fi
 

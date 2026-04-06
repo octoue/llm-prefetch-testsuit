@@ -34,7 +34,7 @@ DATA_DIR="$REPO_ROOT/data"
 # ============================================================
 # Defaults
 # ============================================================
-MODEL_PATH="${MODEL_PATH:-/path/to/mixtral-8x7b}"  # TODO: 填写模型路径
+MODEL_PATH="${MODEL_PATH:-/lpai/models/mistralai__mixtral-8x7b-instruct-v0_1/24-08-19-1318}"
 API_PORT="${API_PORT:-8000}"
 QPS=1.0
 DATASET="pcie-heavy"
@@ -75,8 +75,8 @@ done
 # ============================================================
 # Validate
 # ============================================================
-if [[ "$MODEL_PATH" == "/path/to/mixtral-8x7b" ]]; then
-    echo "Error: 请使用 --model 或 MODEL_PATH 指定 Mixtral-8x7B 路径"
+if [[ ! -d "$MODEL_PATH" ]]; then
+    echo "Error: 模型路径不存在: $MODEL_PATH"
     exit 1
 fi
 
