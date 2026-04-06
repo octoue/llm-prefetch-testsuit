@@ -141,12 +141,16 @@ trap cleanup EXIT INT TERM
 # ============================================================
 start_vllm() {
     local label="$1"
-    local enable_eplb="$2"     # 0 or 1
+    local enable_eplb="$2"          # 0 or 1
+    local enable_pcie_sched="${3:-0}" # 0 or 1
+    local enable_eplb_phase="${4:-0}" # 0 or 1
 
     echo ""
     echo "========================================"
     echo "Starting vLLM [$label]"
     echo "  EP=$EP_SIZE, EPLB=$([ "$enable_eplb" -eq 1 ] && echo ON || echo OFF)"
+    echo "  PCIe Sched=$([ "$enable_pcie_sched" -eq 1 ] && echo ON || echo OFF)"
+    echo "  EPLB Phase=$([ "$enable_eplb_phase" -eq 1 ] && echo ON || echo OFF)"
     echo "  Offloading=${KV_OFFLOADING_SIZE}GiB, gpu_mem_util=$GPU_MEM_UTIL"
     echo "========================================"
 
@@ -192,6 +196,7 @@ start_vllm() {
     fi
 
     NCCL_P2P_DISABLE=1 NCCL_NVLS_ENABLE=0 VLLM_TEST_ENABLE_EP=1 HF_HUB_OFFLINE=1 \
+        VLLM_PCIE_SCHEDULER="$enable_pcie_sched" VLLM_EPLB_PHASE_AWARE="$enable_eplb_phase" \
         vllm serve "${CMD_ARGS[@]}" > "$RESULTS_DIR/vllm_${label}.log" 2>&1 &
     local vllm_pid=$!
     echo "$vllm_pid" > "$PIDFILE"
@@ -329,8 +334,8 @@ fi
 # G4: EP + Offload + Prefetch + EPLB + PCIe Scheduler + EPLB Phase
 # ============================================================
 if should_run_group g4; then
-    # Requires PCIe scheduler + EPLB Phase-Aware
-    VLLM_PCIE_SCHEDULER=1 VLLM_EPLB_PHASE_AWARE=1 start_vllm "g4" 1 || exit 1
+    # PCIe scheduler + EPLB Phase-Aware (args: label, eplb, pcie_sched, eplb_phase)
+    start_vllm "g4" 1 1 1 || exit 1
     run_workload "prefetch" "g4_sched_eplb_phase"
     stop_vllm
 fi
