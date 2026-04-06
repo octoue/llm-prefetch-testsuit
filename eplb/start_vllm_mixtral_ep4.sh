@@ -145,45 +145,35 @@ if [[ $ENABLE_EPLB -eq 1 ]]; then
 fi
 
 # ============================================================
-# Launch
+# Launch (setsid so all workers share the same process group)
 # ============================================================
 if [[ -n "$LOG_FILE" ]]; then
     [[ "$LOG_FILE" != /* ]] && LOG_FILE="$(pwd)/$LOG_FILE"
     mkdir -p "$(dirname "$LOG_FILE")"
     echo "Log: $LOG_FILE"
-    VLLM_TEST_ENABLE_EP=1 HF_HUB_OFFLINE=1 vllm serve "${CMD_ARGS[@]}" > "$LOG_FILE" 2>&1 &
+    setsid VLLM_TEST_ENABLE_EP=1 HF_HUB_OFFLINE=1 vllm serve "${CMD_ARGS[@]}" > "$LOG_FILE" 2>&1 &
 else
-    VLLM_TEST_ENABLE_EP=1 HF_HUB_OFFLINE=1 vllm serve "${CMD_ARGS[@]}" &
+    setsid VLLM_TEST_ENABLE_EP=1 HF_HUB_OFFLINE=1 vllm serve "${CMD_ARGS[@]}" &
 fi
 
 VLLM_PID=$!
+VLLM_PGID=$VLLM_PID  # setsid makes it its own process group leader
 echo "$VLLM_PID" > "$PIDFILE"
-echo "vLLM PID: $VLLM_PID (saved to $PIDFILE)"
+echo "vLLM PID: $VLLM_PID (PGID: $VLLM_PGID, saved to $PIDFILE)"
 
 cleanup_standalone() {
     echo ""
     echo "Stopping vLLM..."
-    # Graceful TERM
-    if [[ -n "$VLLM_PID" ]] && kill -0 "$VLLM_PID" 2>/dev/null; then
-        kill -TERM "$VLLM_PID" 2>/dev/null || true
+    # Kill entire process group (main + all spawned workers)
+    if [[ -n "$VLLM_PGID" ]]; then
+        kill -TERM -"$VLLM_PGID" 2>/dev/null || true
+        sleep 3
+        kill -9 -"$VLLM_PGID" 2>/dev/null || true
     fi
     rm -f "$PIDFILE"
-    sleep 3
-    # Kill all vllm processes (workers are independent due to multiprocessing spawn)
-    pgrep -f "vllm.entrypoints|vllm.v1.worker|vllm.v1.engine|vllm.executor|multiproc_executor" 2>/dev/null \
-        | xargs kill -9 2>/dev/null || true
+    # Fallback: kill by our port only
     lsof -ti :"$API_PORT" 2>/dev/null | xargs kill -9 2>/dev/null || true
     sleep 2
-    # Last resort: kill GPU-holding vllm/python processes
-    local gpu_pids
-    gpu_pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sort -u) || true
-    for gpid in $gpu_pids; do
-        local cmdline
-        cmdline=$(cat /proc/"$gpid"/cmdline 2>/dev/null | tr '\0' ' ') || true
-        if [[ "$cmdline" == *vllm* ]] || [[ "$cmdline" == *python* ]]; then
-            kill -9 "$gpid" 2>/dev/null || true
-        fi
-    done
     echo "Done."
 }
 

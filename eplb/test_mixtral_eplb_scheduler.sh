@@ -113,40 +113,52 @@ should_run_group() {
 }
 
 # ============================================================
-# Robust cleanup: kill vLLM + all workers + release GPU
+# Robust cleanup: kill OUR vLLM processes only
 # ============================================================
 # vLLM multiproc executor spawns workers via multiprocessing
-# (start_method='spawn'), so workers are NOT children of the
-# main process. We must find them by cmdline pattern and also
-# check nvidia-smi for any GPU-holding processes.
+# (start_method='spawn'). Workers are independent processes,
+# not children of the main PID. We use two safe strategies:
+#
+# 1. Process group kill: we launch vLLM with `setsid` so all
+#    processes (main + workers) share a unique PGID. Killing
+#    the process group kills exactly our processes.
+# 2. Port-based kill: our API_PORT is unique, so any process
+#    holding it belongs to us.
+#
+# We do NOT blanket-kill by cmdline pattern or nvidia-smi,
+# since other users may be running vLLM on this server.
 # ============================================================
 
-stop_all_vllm() {
-    echo ""
-    echo "Cleaning up vLLM processes..."
+# Global: PGID of our current vLLM instance (set in start_vllm)
+VLLM_PGID=""
 
-    # 1) Graceful TERM to main PID (gives vLLM a chance to shut down workers)
+stop_our_vllm() {
+    echo ""
+    echo "Cleaning up our vLLM processes..."
+
+    # 1) Kill by process group (most reliable for spawn workers)
+    if [[ -n "$VLLM_PGID" ]]; then
+        echo "  Sending TERM to process group $VLLM_PGID..."
+        kill -TERM -"$VLLM_PGID" 2>/dev/null || true
+        sleep 3
+        # Force kill if still alive
+        kill -9 -"$VLLM_PGID" 2>/dev/null || true
+        sleep 1
+    fi
+    VLLM_PGID=""
+
+    # 2) Fallback: kill by PID file
     if [[ -f "$PIDFILE" ]]; then
         local pid
         pid=$(cat "$PIDFILE" 2>/dev/null)
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-            echo "  Sending TERM to main PID $pid..."
-            kill -TERM "$pid" 2>/dev/null || true
+            echo "  Killing main PID $pid..."
+            kill -9 "$pid" 2>/dev/null || true
         fi
         rm -f "$PIDFILE"
     fi
-    sleep 3
 
-    # 2) Kill ALL vllm-related processes (main + workers + api server)
-    #    Workers' cmdline contains "vllm" regardless of model name
-    local vllm_pids
-    vllm_pids=$(pgrep -f "vllm.entrypoints|vllm.v1.worker|vllm.v1.engine|vllm.executor|multiproc_executor" 2>/dev/null) || true
-    if [[ -n "$vllm_pids" ]]; then
-        echo "  Killing vllm processes: $(echo $vllm_pids | tr '\n' ' ')"
-        echo "$vllm_pids" | xargs kill -9 2>/dev/null || true
-    fi
-
-    # 3) Kill anything still holding the port
+    # 3) Fallback: kill anything still holding OUR port
     local port_pids
     port_pids=$(lsof -ti :"$API_PORT" 2>/dev/null) || true
     if [[ -n "$port_pids" ]]; then
@@ -155,28 +167,11 @@ stop_all_vllm() {
     fi
 
     sleep 2
-
-    # 4) Last resort: check nvidia-smi for GPU-holding processes and kill
-    #    any that are python/vllm (skip system processes like Xorg)
-    local gpu_pids
-    gpu_pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits 2>/dev/null | sort -u) || true
-    if [[ -n "$gpu_pids" ]]; then
-        for gpid in $gpu_pids; do
-            local cmdline
-            cmdline=$(cat /proc/"$gpid"/cmdline 2>/dev/null | tr '\0' ' ') || true
-            if [[ "$cmdline" == *vllm* ]] || [[ "$cmdline" == *python* ]]; then
-                echo "  Killing GPU process $gpid: ${cmdline:0:80}..."
-                kill -9 "$gpid" 2>/dev/null || true
-            fi
-        done
-        sleep 2
-    fi
-
     echo "  Cleanup done."
 }
 
 cleanup() {
-    stop_all_vllm
+    stop_our_vllm
 }
 trap cleanup EXIT INT TERM
 
@@ -199,7 +194,7 @@ start_vllm() {
     echo "========================================"
 
     # Kill previous vLLM instance
-    stop_all_vllm
+    stop_our_vllm
 
     local CMD_ARGS=(
         --model "$MODEL_PATH"
@@ -235,10 +230,12 @@ start_vllm() {
         ENV_VARS="$ENV_VARS VLLM_EPLB_PHASE_AWARE=1"
     fi
 
-    eval "$ENV_VARS vllm serve ${CMD_ARGS[*]}" > "$RESULTS_DIR/vllm_${label}.log" 2>&1 &
+    eval "setsid $ENV_VARS vllm serve ${CMD_ARGS[*]}" > "$RESULTS_DIR/vllm_${label}.log" 2>&1 &
     local vllm_pid=$!
+    # setsid makes the child its own process group leader, PGID = PID
+    VLLM_PGID=$vllm_pid
     echo "$vllm_pid" > "$PIDFILE"
-    echo "vLLM PID: $vllm_pid"
+    echo "vLLM PID: $vllm_pid (PGID: $VLLM_PGID)"
 
     # Wait for ready
     local max_wait=600
@@ -266,7 +263,7 @@ start_vllm() {
 }
 
 stop_vllm() {
-    stop_all_vllm
+    stop_our_vllm
 }
 
 run_workload() {
