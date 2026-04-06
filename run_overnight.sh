@@ -83,7 +83,7 @@ move_new_results() {
 # ============================================================
 # 实验运行函数
 # ============================================================
-TOTAL_EXPERIMENTS=4
+TOTAL_EXPERIMENTS=1
 CURRENT_EXP=0
 FAILED_LIST=()
 
@@ -138,50 +138,15 @@ echo "  Log: $LOG_FILE"
 echo "================================================================"
 
 # ----------------------------------------------------------
-# 实验1: 32B 模型
+# 72B blk750 补测: QPS 0.5-2.5, 3 轮 (与 32B blk1000 对齐)
 # ----------------------------------------------------------
-run_experiment "32b_pcie_heavy" "$RESULTS_DIR/32b" \
-    --model 32b \
+run_experiment "72b_blk750_3rounds" "$RESULTS_DIR/72b" \
+    --model 72b \
     --qps 0.5,1.0,1.5,2.0,2.5 \
     --rounds 3 \
     --num-blocks 750 \
-    --pp 2 \
-    --dataset pcie-heavy \
-    --closed-loop
-
-# ----------------------------------------------------------
-# 实验2: 72B 模型
-# ----------------------------------------------------------
-
-# 2.1: num-blocks 750, qps 1.0,1.5,2.0
-run_experiment "72b_blk750" "$RESULTS_DIR/72b" \
-    --model 72b \
-    --qps 1.0,1.5,2.0 \
-    --rounds 1 \
-    --num-blocks 750 \
     --pp 4 \
     --dataset pcie-heavy \
-    --closed-loop
-
-# 2.2: num-blocks 500, qps 1.0,1.5,2.0
-run_experiment "72b_blk500" "$RESULTS_DIR/72b" \
-    --model 72b \
-    --qps 1.0,1.5,2.0 \
-    --rounds 1 \
-    --num-blocks 500 \
-    --pp 4 \
-    --dataset pcie-heavy \
-    --closed-loop
-
-# 2.3: max-num-seqs 128, num-blocks 500, qps 0.5,1.0,1.5
-run_experiment "72b_blk500_seqs128" "$RESULTS_DIR/72b" \
-    --model 72b \
-    --qps 0.5,1.0,1.5 \
-    --rounds 1 \
-    --num-blocks 500 \
-    --pp 4 \
-    --dataset pcie-heavy \
-    --max-num-seqs 128 \
     --closed-loop
 
 # ============================================================
@@ -190,7 +155,6 @@ run_experiment "72b_blk500_seqs128" "$RESULTS_DIR/72b" \
 echo ""
 echo "================================================================"
 echo "[$(date)] All experiments finished!"
-echo "  32B results: $RESULTS_DIR/32b/"
 echo "  72B results: $RESULTS_DIR/72b/"
 if [[ ${#FAILED_LIST[@]} -gt 0 ]]; then
     echo "  FAILED experiments: ${FAILED_LIST[*]}"
