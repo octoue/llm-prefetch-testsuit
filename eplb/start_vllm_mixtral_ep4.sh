@@ -33,7 +33,7 @@ API_PORT="${API_PORT:-8000}"
 LOG_FILE=""
 NUM_REDUNDANT_EXPERTS=0
 EPLB_STEP_INTERVAL=100
-GPU_MEM_UTIL=0.5
+GPU_MEM_UTIL=0.4
 MAX_NUM_SEQS=32
 MAX_MODEL_LEN=4096
 KV_OFFLOADING_SIZE=20
@@ -160,7 +160,31 @@ VLLM_PID=$!
 echo "$VLLM_PID" > "$PIDFILE"
 echo "vLLM PID: $VLLM_PID (saved to $PIDFILE)"
 
-trap 'kill -TERM $VLLM_PID 2>/dev/null; wait $VLLM_PID 2>/dev/null; rm -f "$PIDFILE"' EXIT INT TERM
+kill_process_tree() {
+    local pid="$1"
+    local children
+    children=$(pgrep -P "$pid" 2>/dev/null) || true
+    for child in $children; do
+        kill_process_tree "$child"
+    done
+    kill -9 "$pid" 2>/dev/null || true
+}
+
+cleanup_standalone() {
+    echo ""
+    echo "Stopping vLLM..."
+    if [[ -n "$VLLM_PID" ]] && kill -0 "$VLLM_PID" 2>/dev/null; then
+        kill -TERM "$VLLM_PID" 2>/dev/null || true
+        sleep 2
+        kill_process_tree "$VLLM_PID"
+    fi
+    rm -f "$PIDFILE"
+    # Kill anything still on the port
+    lsof -ti :"$API_PORT" 2>/dev/null | xargs kill -9 2>/dev/null || true
+    echo "Done."
+}
+
+trap cleanup_standalone EXIT INT TERM
 
 wait $VLLM_PID
 EXIT_CODE=$?

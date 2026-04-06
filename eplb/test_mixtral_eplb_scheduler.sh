@@ -41,7 +41,7 @@ DATASET="pcie-heavy"
 RUN_GROUPS="all"
 EPLB_STEP_INTERVAL=100
 EP_SIZE=4
-GPU_MEM_UTIL=0.5
+GPU_MEM_UTIL=0.4
 MAX_NUM_SEQS=32
 MAX_MODEL_LEN=4096
 KV_OFFLOADING_SIZE=20
@@ -113,24 +113,65 @@ should_run_group() {
 }
 
 # ============================================================
-# Cleanup
+# Robust cleanup: kill vLLM process tree + release GPU
 # ============================================================
-cleanup() {
+kill_process_tree() {
+    local pid="$1"
+    # Find all descendants (children, grandchildren, etc.)
+    local children
+    children=$(pgrep -P "$pid" 2>/dev/null) || true
+    for child in $children; do
+        kill_process_tree "$child"
+    done
+    kill -9 "$pid" 2>/dev/null || true
+}
+
+stop_all_vllm() {
     echo ""
-    echo "Cleaning up..."
+    echo "Cleaning up vLLM processes..."
+
+    # 1) Kill by PID file (main process + entire tree)
     if [[ -f "$PIDFILE" ]]; then
         local pid
         pid=$(cat "$PIDFILE" 2>/dev/null)
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-            kill "$pid" 2>/dev/null || true
-            sleep 3
-            kill -9 "$pid" 2>/dev/null || true
+            echo "  Killing process tree rooted at PID $pid..."
+            # Try graceful TERM first
+            kill -TERM "$pid" 2>/dev/null || true
+            sleep 2
+            # Then force-kill entire tree
+            kill_process_tree "$pid"
         fi
         rm -f "$PIDFILE"
     fi
-    lsof -ti :"$API_PORT" 2>/dev/null | xargs kill -9 2>/dev/null || true
-    sleep 2
-    echo "Cleanup done."
+
+    # 2) Kill anything still holding the port
+    local port_pids
+    port_pids=$(lsof -ti :"$API_PORT" 2>/dev/null) || true
+    if [[ -n "$port_pids" ]]; then
+        echo "  Killing remaining processes on port $API_PORT: $port_pids"
+        echo "$port_pids" | xargs kill -9 2>/dev/null || true
+    fi
+
+    # 3) Kill any orphaned vllm worker processes from our model
+    local orphans
+    orphans=$(pgrep -f "vllm.entrypoints.*--port $API_PORT" 2>/dev/null) || true
+    if [[ -n "$orphans" ]]; then
+        echo "  Killing orphaned vllm entrypoint processes: $orphans"
+        echo "$orphans" | xargs kill -9 2>/dev/null || true
+    fi
+    orphans=$(pgrep -f "vllm.v1.worker.*mixtral" 2>/dev/null) || true
+    if [[ -n "$orphans" ]]; then
+        echo "  Killing orphaned vllm worker processes: $orphans"
+        echo "$orphans" | xargs kill -9 2>/dev/null || true
+    fi
+
+    sleep 3
+    echo "  Cleanup done."
+}
+
+cleanup() {
+    stop_all_vllm
 }
 trap cleanup EXIT INT TERM
 
@@ -152,19 +193,8 @@ start_vllm() {
     echo "  Offloading=${KV_OFFLOADING_SIZE}GiB, gpu_mem_util=$GPU_MEM_UTIL"
     echo "========================================"
 
-    # Kill previous
-    if [[ -f "$PIDFILE" ]]; then
-        local old_pid
-        old_pid=$(cat "$PIDFILE" 2>/dev/null)
-        if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
-            kill "$old_pid" 2>/dev/null || true
-            sleep 3
-            kill -9 "$old_pid" 2>/dev/null || true
-        fi
-        rm -f "$PIDFILE"
-    fi
-    lsof -ti :"$API_PORT" 2>/dev/null | xargs kill -9 2>/dev/null || true
-    sleep 2
+    # Kill previous vLLM instance
+    stop_all_vllm
 
     local CMD_ARGS=(
         --model "$MODEL_PATH"
@@ -231,23 +261,7 @@ start_vllm() {
 }
 
 stop_vllm() {
-    if [[ -f "$PIDFILE" ]]; then
-        local pid
-        pid=$(cat "$PIDFILE" 2>/dev/null)
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-            echo "Stopping vLLM (PID: $pid)..."
-            kill "$pid" 2>/dev/null || true
-            local waited=0
-            while kill -0 "$pid" 2>/dev/null && [[ $waited -lt 15 ]]; do
-                sleep 1
-                waited=$((waited + 1))
-            done
-            kill -9 "$pid" 2>/dev/null || true
-        fi
-        rm -f "$PIDFILE"
-    fi
-    lsof -ti :"$API_PORT" 2>/dev/null | xargs kill -9 2>/dev/null || true
-    sleep 3
+    stop_all_vllm
 }
 
 run_workload() {
