@@ -58,7 +58,7 @@ done
 source "$RUN_EXP_DIR/scripts/utils/gpu_lock.sh"
 
 NUM_GPUS="${VLLM_TENSOR_PARALLEL_SIZE:-1}"
-if ! wait_for_free_gpus "$NUM_GPUS" "${GPU_WAIT_TIMEOUT:-7200}"; then
+if ! wait_for_free_gpus "$NUM_GPUS" "${GPU_WAIT_TIMEOUT:-0}"; then
   echo "ERROR: 无法获取 $NUM_GPUS 张空闲 GPU，退出"
   exit 1
 fi

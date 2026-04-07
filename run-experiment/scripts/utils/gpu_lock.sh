@@ -175,17 +175,23 @@ wait_for_free_gpus() {
 
     _init_lock_dir
 
-    echo "GPU Lock: 等待 $needed 张空闲 GPU (超时 ${timeout}s)..."
+    if (( timeout == 0 )); then
+        echo "GPU Lock: 等待 $needed 张空闲 GPU (无超时限制)..."
+    else
+        echo "GPU Lock: 等待 $needed 张空闲 GPU (超时 ${timeout}s)..."
+    fi
 
-    while (( waited < timeout )); do
+    while true; do
         if acquire_gpus "$needed"; then
             return 0
         fi
-        echo "  等待中... (${waited}/${timeout}s)"
+        # timeout=0 表示无限等待
+        if (( timeout > 0 && waited >= timeout )); then
+            echo "GPU Lock: 超时！${timeout}s 内未找到 $needed 张空闲 GPU"
+            return 1
+        fi
+        echo "  等待中... (${waited}s$([ "$timeout" -gt 0 ] && echo "/${timeout}s" || echo " / ∞"))"
         sleep 10
         waited=$((waited + 10))
     done
-
-    echo "GPU Lock: 超时！${timeout}s 内未找到 $needed 张空闲 GPU"
-    return 1
 }

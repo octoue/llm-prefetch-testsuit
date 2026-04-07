@@ -31,8 +31,8 @@ cleanup_resources() {
         sleep 2
     fi
 
-    # 清理可能残留的 vllm 进程
-    pkill -f "vllm.entrypoints" 2>/dev/null || true
+    # 注意: 不使用 pkill -f "vllm.entrypoints"，避免误杀其他用户的 vLLM 进程
+    # run_pcie.sh 自身的 cleanup 已通过 PID 追踪 + 端口清理处理了进程回收
     sleep 3
 
     # 清理 GPU 锁

@@ -98,7 +98,7 @@ NUM_GPUS=$PP_SIZE
 # 加载 GPU 锁管理工具，选择空闲且未被其他实验占用的 GPU
 source "$SCRIPT_DIR/scripts/utils/gpu_lock.sh"
 
-if ! wait_for_free_gpus "$NUM_GPUS" 600; then
+if ! wait_for_free_gpus "$NUM_GPUS" "${GPU_WAIT_TIMEOUT:-0}"; then
   echo "ERROR: 无法获取 $NUM_GPUS 张空闲 GPU，退出"
   exit 1
 fi
