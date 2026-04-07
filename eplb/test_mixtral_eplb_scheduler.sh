@@ -331,7 +331,7 @@ start_vllm() {
     if [[ "$enable_eplb" -eq 1 ]]; then
         CMD_ARGS+=(
             --enable-eplb
-            --eplb-config "{\"step_interval\": $EPLB_STEP_INTERVAL, \"num_redundant_experts\": 0}"
+            --eplb-config "{\"step_interval\": $EPLB_STEP_INTERVAL, \"num_redundant_experts\": 0, \"use_async\": true}"
         )
     fi
 
