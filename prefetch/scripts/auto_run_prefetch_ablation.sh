@@ -119,6 +119,8 @@ stop_vllm() {
         fi
         VLLM_PID=""
     fi
+    # 释放已死子进程留下的 GPU 锁
+    _clean_stale_locks 2>/dev/null || true
     sleep 3
 }
 
@@ -130,16 +132,8 @@ cleanup() {
     stop_vllm
     # 终止本脚本的所有子进程 (python runner 等)
     pkill -P $$ 2>/dev/null || true
-    # 兜底：杀掉本脚本占用端口的残留进程
-    local pids
-    pids=$(lsof -ti :"$API_PORT" 2>/dev/null) || true
-    if [[ -n "$pids" ]]; then
-        echo "Killing residual processes on port $API_PORT: $pids"
-        echo "$pids" | xargs kill -9 2>/dev/null || true
-        sleep 2
-    fi
     # 清理子进程遗留的过期 GPU 锁
-    source "$RUN_EXP_DIR/scripts/utils/gpu_lock.sh" 2>/dev/null && _clean_stale_locks 2>/dev/null || true
+    _clean_stale_locks 2>/dev/null || true
     rm -f "$SCRIPT_DIR/.ablation.pid" 2>/dev/null
 }
 trap cleanup EXIT INT TERM HUP
@@ -155,6 +149,7 @@ echo $$ > "$SCRIPT_DIR/.ablation.pid"
 source "$RUN_EXP_DIR/config/system.env"
 source "$RUN_EXP_DIR/config/datasets.env"
 source "$RUN_EXP_DIR/scripts/utils/common.sh"
+source "$RUN_EXP_DIR/scripts/utils/gpu_lock.sh"
 
 # 恢复调用者传入的端口覆盖
 [[ -n "$_SAVED_API_PORT" ]] && API_PORT="$_SAVED_API_PORT"
@@ -203,7 +198,7 @@ generate_dataset_if_needed "$TRACE" "$FULL_TRACE" "$DATASET" || exit 1
 
 # Timeout 配置 (与原脚本保持一致)
 RUNNER_TIMEOUT_ARGS=(--timeout "$TIMEOUT" --request-timeout "$REQUEST_TIMEOUT")
-if [[ "$DATASET" == "pcie-full" || "$DATASET" == "pcie-trace-a-light" || "$DATASET" == "pcie-multiturn" || "$DATASET" == "pcie-heavy" ]]; then
+if [[ "$DATASET" == "pcie-full" || "$DATASET" == "pcie-trace-a-light" || "$DATASET" == "pcie-multiturn" || "$DATASET" == "pcie-heavy" || "$DATASET" == pcie-heavy-8k* || "$DATASET" == "prefetch-ablation" ]]; then
     if [[ ! -f "$TRACE" ]]; then
         echo "❌ $DATASET: trace 不存在: $TRACE"
         exit 1
@@ -279,6 +274,12 @@ run_experiment() {
 
     echo ""
     echo "--- [$LABEL] mode=$MODE qps=$QPS_VAL lead_time=$LEAD_TIME_VAL ---"
+
+    # 检查 vLLM 是否存活（Groups D/E 共享同一 vLLM 实例，中途可能崩溃）
+    if ! curl -s --max-time 10 "http://localhost:$API_PORT/health" &>/dev/null; then
+        echo "  [$LABEL] vLLM is not healthy, skipping"
+        return 1
+    fi
 
     curl -s -X POST "http://localhost:$API_PORT/reset_prefix_cache?reset_external=true" >/dev/null || true
     sleep 3
@@ -422,7 +423,7 @@ if should_run E; then
         record_skip "[Group E] vLLM 启动失败"
         stop_vllm
     else
-        for Q in 0.2 0.4 0.6 0.8 1.0; do
+        for Q in ${QPS_LIST:-0.2 0.4 0.6 0.8 1.0}; do
             run_experiment "E-baseline-q${Q}" "baseline" "$Q" "$DEFAULT_LEAD_TIME" \
                 "E_baseline_q${Q}" \
                 || record_skip "[Group E] baseline qps=${Q} 实验失败"
