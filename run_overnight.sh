@@ -83,7 +83,7 @@ move_new_results() {
 # ============================================================
 # 实验运行函数
 # ============================================================
-TOTAL_EXPERIMENTS=1
+TOTAL_EXPERIMENTS=5
 CURRENT_EXP=0
 FAILED_LIST=()
 
@@ -138,16 +138,39 @@ echo "  Log: $LOG_FILE"
 echo "================================================================"
 
 # ----------------------------------------------------------
-# 72B blk750 补测: QPS 0.5-2.5, 3 轮 (与 32B blk1000 对齐)
+# 72B 参数调优: 增大 GPU Blocks + Lead Time
+# 目标: 验证 Full vs G1 在更大 cache / 更长 lead time 下的收益
+# 矩阵: blk={1000,1250} x lead_time={3.0,4.0} x qps={1.0,1.5,2.0,2.5,3.0}
 # ----------------------------------------------------------
-run_experiment "72b_blk750_3rounds" "$RESULTS_DIR/72b" \
-    --model 72b \
-    --qps 0.5,1.0,1.5,2.0,2.5 \
-    --rounds 3 \
-    --num-blocks 750 \
-    --pp 4 \
-    --dataset pcie-heavy \
-    --closed-loop
+
+QPS_LIST="1.0,1.5,2.0,2.5,3.0"
+ROUNDS=3
+MODEL_ARGS=(--model 72b --pp 4 --dataset pcie-heavy --closed-loop)
+
+# --- 组合 1: blk1000 + lead_time 3.0 (最高优先级) ---
+run_experiment "72b_blk1000_lt3.0" "$RESULTS_DIR/72b" \
+    "${MODEL_ARGS[@]}" --qps "$QPS_LIST" --rounds "$ROUNDS" \
+    --num-blocks 1000 --lead-time 3.0
+
+# --- 组合 2: blk1000 + lead_time 4.0 ---
+run_experiment "72b_blk1000_lt4.0" "$RESULTS_DIR/72b" \
+    "${MODEL_ARGS[@]}" --qps "$QPS_LIST" --rounds "$ROUNDS" \
+    --num-blocks 1000 --lead-time 4.0
+
+# --- 组合 3: blk1250 + lead_time 3.0 ---
+run_experiment "72b_blk1250_lt3.0" "$RESULTS_DIR/72b" \
+    "${MODEL_ARGS[@]}" --qps "$QPS_LIST" --rounds "$ROUNDS" \
+    --num-blocks 1250 --lead-time 3.0
+
+# --- 组合 4: blk1250 + lead_time 4.0 ---
+run_experiment "72b_blk1250_lt4.0" "$RESULTS_DIR/72b" \
+    "${MODEL_ARGS[@]}" --qps "$QPS_LIST" --rounds "$ROUNDS" \
+    --num-blocks 1250 --lead-time 4.0
+
+# --- 对照组: blk1000 + lead_time 2.0 (原始参数, 用于控制变量) ---
+run_experiment "72b_blk1000_lt2.0_baseline" "$RESULTS_DIR/72b" \
+    "${MODEL_ARGS[@]}" --qps "$QPS_LIST" --rounds "$ROUNDS" \
+    --num-blocks 1000 --lead-time 2.0
 
 # ============================================================
 # 总结
@@ -155,6 +178,7 @@ run_experiment "72b_blk750_3rounds" "$RESULTS_DIR/72b" \
 echo ""
 echo "================================================================"
 echo "[$(date)] All experiments finished!"
+echo "  Total: $TOTAL_EXPERIMENTS experiments"
 echo "  72B results: $RESULTS_DIR/72b/"
 if [[ ${#FAILED_LIST[@]} -gt 0 ]]; then
     echo "  FAILED experiments: ${FAILED_LIST[*]}"
