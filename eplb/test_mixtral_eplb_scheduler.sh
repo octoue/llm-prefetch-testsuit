@@ -73,6 +73,112 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ============================================================
+# Auto GPU selection: pick the least busy EP_SIZE GPUs
+# ============================================================
+# Strategy:
+#   - GPU utilization (compute) interference is WORSE than memory occupation
+#     because this experiment is sensitive to PCIe bandwidth and compute.
+#   - Someone's idle model sitting in VRAM (high mem, low util) is tolerable;
+#     active compute (high util) directly competes for resources.
+#   - Score = 0.7 * gpu_util% + 0.3 * mem_used%  (lower is better)
+#   - Reject a GPU if mem_used > 80% OR gpu_util > 50%
+#   - Abort if fewer than EP_SIZE GPUs pass the threshold.
+# ============================================================
+auto_select_gpus() {
+    local needed=$1
+
+    if ! command -v nvidia-smi &>/dev/null; then
+        echo "Error: nvidia-smi not found, cannot auto-select GPUs."
+        exit 1
+    fi
+
+    # Query: index, gpu_util%, memory_used_MiB, memory_total_MiB
+    local gpu_info
+    gpu_info=$(nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total \
+               --format=csv,noheader,nounits 2>/dev/null)
+
+    if [[ -z "$gpu_info" ]]; then
+        echo "Error: 无法获取 GPU 信息"
+        exit 1
+    fi
+
+    echo ""
+    echo "========================================"
+    echo "GPU 资源探测"
+    echo "========================================"
+    echo "GPU  |  Util%  |  MemUsed(MiB)  |  MemTotal(MiB)  |  MemUsed%  |  Score  |  Status"
+    echo "-----|---------|----------------|-----------------|------------|---------|--------"
+
+    local -a eligible_gpus=()   # "score:index" pairs
+    local -a rejected_gpus=()
+
+    while IFS=',' read -r idx util mem_used mem_total; do
+        # Trim whitespace
+        idx=$(echo "$idx" | xargs)
+        util=$(echo "$util" | xargs)
+        mem_used=$(echo "$mem_used" | xargs)
+        mem_total=$(echo "$mem_total" | xargs)
+
+        # Calculate mem usage percentage (integer arithmetic)
+        local mem_pct=0
+        if [[ "$mem_total" -gt 0 ]]; then
+            mem_pct=$((mem_used * 100 / mem_total))
+        fi
+
+        # Score: 0.7 * util + 0.3 * mem_pct (scaled x100 for integer math)
+        local score=$(( 70 * util + 30 * mem_pct ))
+
+        local status="OK"
+        if [[ "$mem_pct" -gt 80 ]] || [[ "$util" -gt 50 ]]; then
+            status="BUSY"
+            rejected_gpus+=("$idx")
+        else
+            eligible_gpus+=("${score}:${idx}")
+        fi
+
+        printf "%-4s |  %5s  |  %12s  |  %13s  |  %8s%%  |  %5s  |  %s\n" \
+            "$idx" "$util" "$mem_used" "$mem_total" "$mem_pct" "$((score / 100))" "$status"
+    done <<< "$gpu_info"
+
+    echo ""
+
+    if [[ ${#eligible_gpus[@]} -lt $needed ]]; then
+        echo "========================================" >&2
+        echo "当前没有可用资源" >&2
+        echo "需要 $needed 块空闲 GPU，但只有 ${#eligible_gpus[@]} 块满足条件" >&2
+        echo "(阈值: 显存占用 ≤80%, GPU利用率 ≤50%)" >&2
+        if [[ ${#rejected_gpus[@]} -gt 0 ]]; then
+            echo "被排除的 GPU: ${rejected_gpus[*]}" >&2
+        fi
+        echo "========================================" >&2
+        exit 1
+    fi
+
+    # Sort eligible GPUs by score (ascending = least busy first)
+    IFS=$'\n' sorted=($(printf '%s\n' "${eligible_gpus[@]}" | sort -t: -k1 -n))
+    unset IFS
+
+    # Pick the best N GPUs
+    local selected=()
+    for ((i = 0; i < needed; i++)); do
+        local entry="${sorted[$i]}"
+        selected+=("${entry#*:}")   # extract index after ':'
+    done
+
+    # Join with comma
+    local gpu_list
+    gpu_list=$(IFS=,; echo "${selected[*]}")
+
+    echo "自动选择 GPU: $gpu_list (共 $needed 块, 按空闲程度排序)"
+    echo "========================================"
+    echo ""
+
+    export CUDA_VISIBLE_DEVICES="$gpu_list"
+}
+
+auto_select_gpus "$EP_SIZE"
+
+# ============================================================
 # Validate
 # ============================================================
 if [[ ! -d "$MODEL_PATH" ]]; then
