@@ -48,6 +48,7 @@ KV_OFFLOADING_SIZE=20
 PREFETCH_LEAD_TIME=2.0
 REQUEST_TIMEOUT=360
 ROUNDS=1
+NUM_GPU_BLOCKS=""
 
 # ============================================================
 # Parse args
@@ -64,6 +65,7 @@ while [[ $# -gt 0 ]]; do
         --gpu-mem-util)    GPU_MEM_UTIL="$2";            shift 2 ;;
         --lead-time)       PREFETCH_LEAD_TIME="$2";      shift 2 ;;
         --kv-offloading)   KV_OFFLOADING_SIZE="$2";      shift 2 ;;
+        --num-gpu-blocks)  NUM_GPU_BLOCKS="$2";          shift 2 ;;
         --rounds)          ROUNDS="$2";                  shift 2 ;;
         -h|--help)
             sed -n '2,/^$/p' "$0" | grep '^#' | sed 's/^# \?//'
@@ -297,6 +299,7 @@ start_vllm() {
     echo "  PCIe Scheduler=$([ "$enable_pcie_sched" -eq 1 ] && echo ON || echo OFF)"
     echo "  EPLB Phase=$([ "$enable_eplb_phase" -eq 1 ] && echo ON || echo OFF)"
     echo "  Offloading=${KV_OFFLOADING_SIZE}GiB, gpu_mem_util=$GPU_MEM_UTIL"
+    [[ -n "$NUM_GPU_BLOCKS" ]] && echo "  GPU blocks override=$NUM_GPU_BLOCKS"
     echo "========================================"
 
     # Kill previous vLLM instance
@@ -320,6 +323,10 @@ start_vllm() {
         --enable-prefix-caching
         --disable-hybrid-kv-cache-manager
     )
+
+    if [[ -n "$NUM_GPU_BLOCKS" ]]; then
+        CMD_ARGS+=(--num-gpu-blocks-override "$NUM_GPU_BLOCKS")
+    fi
 
     if [[ "$enable_eplb" -eq 1 ]]; then
         CMD_ARGS+=(
@@ -417,6 +424,7 @@ echo "Dataset:    $DATASET ($TRACE_FILE)"
 echo "QPS:        $QPS"
 echo "Offload:    ${KV_OFFLOADING_SIZE}GiB"
 echo "GPU Mem:    $GPU_MEM_UTIL"
+[[ -n "$NUM_GPU_BLOCKS" ]] && echo "GPU Blocks: $NUM_GPU_BLOCKS (override)"
 echo "Lead time:  ${PREFETCH_LEAD_TIME}s"
 echo "EPLB step:  $EPLB_STEP_INTERVAL"
 echo "Groups:     $RUN_GROUPS"

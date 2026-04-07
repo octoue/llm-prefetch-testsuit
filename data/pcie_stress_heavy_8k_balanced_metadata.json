@@ -1,21 +1,24 @@
 {
-  "num_conversations": 60,
-  "total_samples": 255,
-  "turns_range": [
-    3,
-    12
-  ],
-  "input_length_max": 8192,
-  "total_tokens_max": 80000,
-  "sampling_mode": "random",
-  "seed": 42,
-  "pcie_pressure": {
-    "peak_blocks_needed": 39203,
-    "gpu_blocks_configured": 1000,
-    "pressure_ratio": 39.203,
-    "h2d_operations": 255,
-    "d2h_operations": 58,
     "num_conversations": 60,
-    "total_turns": 255
-  }
+    "total_samples": 255,
+    "turns_range": [
+        3,
+        12
+    ],
+    "input_length_max": 8192,
+    "total_tokens_max": 80000,
+    "sampling_mode": "random",
+    "seed": 42,
+    "pcie_pressure": {
+        "peak_blocks_needed": 39203,
+        "gpu_blocks_configured": 1000,
+        "pressure_ratio": 39.203,
+        "h2d_operations": 255,
+        "d2h_operations": 58,
+        "num_conversations": 60,
+        "total_turns": 255
+    },
+    "max_total_safe": 7680,
+    "output_capped": true,
+    "output_cap_note": "2 records capped to ensure input+output <= 7680 (8192-512 safety margin)"
 }
