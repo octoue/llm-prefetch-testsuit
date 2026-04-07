@@ -340,7 +340,7 @@ fi
 if should_run B; then
     print_phase "[Group B] Admission Threshold Ablation"
 
-    for THRESH in 0 50 100 150 200 300; do
+    for THRESH in 0 50 100 150 200 300 400 500; do
         if ! start_vllm "B_thresh${THRESH}" \
             --prefetch-block-threshold "$THRESH" \
             --max-prefetch-block-ratio 0.3; then
