@@ -202,6 +202,10 @@ start_vllm() {
     fi
 
     export NCCL_P2P_DISABLE=1 NCCL_NVLS_ENABLE=0 VLLM_TEST_ENABLE_EP=1 HF_HUB_OFFLINE=1
+    # 关键: 这是 EP-only 实验, 没有 PP. PP phase aware 的 IDLE-window 计数器
+    # 在没有 PP phase 切换时永远不会 reset, 一旦耗尽 H2D 就会被永久 block.
+    # 即使有同名代码守卫, 显式关掉作为双保险.
+    export VLLM_PCIE_PP_PHASE_AWARE=0
     unset VLLM_PCIE_SCHEDULER VLLM_EPLB_PHASE_AWARE
     [[ "$enable_pcie_sched" -eq 1 ]] && export VLLM_PCIE_SCHEDULER=1
     [[ "$enable_eplb_phase" -eq 1 ]] && export VLLM_EPLB_PHASE_AWARE=1
@@ -240,9 +244,12 @@ verify_hook_registration() {
     local label="$2"
     local enable_eplb="$3"
     local enable_pcie_sched="$4"
+    local enable_eplb_phase="$5"
 
-    # 只有同时开了 eplb 和 scheduler 的 group 才需要 hook
-    if [[ "$enable_eplb" -ne 1 ]] || [[ "$enable_pcie_sched" -ne 1 ]]; then
+    # 只有同时开了 eplb + scheduler + eplb_phase 的 group 才需要 hook.
+    # g3 (eplb_phase=0) 不触发 set_pcie_scheduler_hooks, 没 hook 是正常的.
+    if [[ "$enable_eplb" -ne 1 ]] || [[ "$enable_pcie_sched" -ne 1 ]] \
+       || [[ "$enable_eplb_phase" -ne 1 ]]; then
         return 0
     fi
 
@@ -330,9 +337,9 @@ inspect_run_health() {
     local label="$2"
 
     local block_fails
-    block_fails=$(grep -c "Block allocation failed" "$vllm_log" 2>/dev/null || echo 0)
+    block_fails=$(grep "Block allocation failed" "$vllm_log" 2>/dev/null | wc -l | tr -d ' ')
     local rearrange_count
-    rearrange_count=$(grep -c "Rearranging experts" "$vllm_log" 2>/dev/null || echo 0)
+    rearrange_count=$(grep "Rearranging experts" "$vllm_log" 2>/dev/null | wc -l | tr -d ' ')
     local balancedness
     balancedness=$(grep "balancedness=" "$vllm_log" 2>/dev/null | tail -1 \
         | sed -n 's/.*balancedness=\([0-9.]*\).*/\1/p')
@@ -474,23 +481,23 @@ print(f'| $qps | {delta(g2,g4,np.mean)} | {delta(g2,g4,lambda x: np.percentile(x
                     local vlog="$qps_dir/vllm_${group}_r${r}.log"
                     [[ -f "$vlog" ]] || continue
                     local bf rc bal
-                    bf=$(grep -c "Block allocation failed" "$vlog" 2>/dev/null || echo 0)
-                    rc=$(grep -c "Rearranging experts sync" "$vlog" 2>/dev/null || echo 0)
+                    bf=$(grep "Block allocation failed" "$vlog" 2>/dev/null | wc -l | tr -d ' ')
+                    rc=$(grep "Rearranging experts" "$vlog" 2>/dev/null | wc -l | tr -d ' ')
                     bal=$(grep "balancedness=" "$vlog" 2>/dev/null | tail -1 | sed -n 's/.*balancedness=\([0-9.]*\).*/\1/p')
-                    echo "| $qps | $group | $r | $rc | $bf | ${bal:-NA} |"
+                    echo "| $qps | $group | $r | ${rc:-0} | ${bf:-0} | ${bal:-NA} |"
                 done
             done
         done
         echo ""
 
-        echo "## Hook registration check"
+        echo "## Hook registration check (g4 only)"
         echo ""
         echo "| QPS | Group | Round | Hook Registered |"
         echo "|-----|-------|-------|-----------------|"
         for qps in $QPS_LIST; do
             local qps_tag="${qps//./_}"
             local qps_dir="$RESULTS_ROOT/qps_${qps_tag}"
-            for group in g3 g4; do
+            for group in g4; do
                 if ! should_run_group "$group"; then continue; fi
                 for r in $(seq 1 "$ROUNDS"); do
                     local vlog="$qps_dir/vllm_${group}_r${r}.log"
@@ -581,7 +588,7 @@ for round in $(seq 1 "$ROUNDS"); do
 
             # sanity check: hook registration (if applicable)
             sleep 2
-            verify_hook_registration "$vllm_log" "$group" "$enable_eplb" "$enable_sched" || true
+            verify_hook_registration "$vllm_log" "$group" "$enable_eplb" "$enable_sched" "$enable_phase" || true
 
             if run_workload "$mode" "$qps" "$group" "$round" "$qps_dir"; then
                 PASSED=$((PASSED + 1))
