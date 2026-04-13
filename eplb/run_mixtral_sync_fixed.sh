@@ -48,6 +48,7 @@ EPLB_STEP_INTERVAL=200            # 关键: 从 50 调到 200, rearrange 频率 
 PREFETCH_LEAD_TIME=2.0
 REQUEST_TIMEOUT=360
 DATASET="pcie-heavy"
+NUM_CONV_OVERRIDE=""               # 传入 --num-conv 时覆盖默认值
 QPS_LIST="0.5 1.0 1.5 2.0"        # 不跑 2.5, 那已经在 cliff 之外
 RUN_GROUPS="g1,g2,g3,g4"
 ROUNDS=3
@@ -70,6 +71,8 @@ while [[ $# -gt 0 ]]; do
         --step-interval)    EPLB_STEP_INTERVAL="$2";    shift 2 ;;
         --ep-size)          EP_SIZE="$2";               shift 2 ;;
         --gpus)             GPU_LIST="$2";              shift 2 ;;
+        --dataset)          DATASET="$2";               shift 2 ;;
+        --num-conv)         NUM_CONV_OVERRIDE="$2";     shift 2 ;;
         --dry-run)          DRY_RUN=1;                  shift ;;
         -h|--help)
             sed -n '2,/^$/p' "$0" | grep '^#' | sed 's/^# \?//'
@@ -91,10 +94,13 @@ echo "========================================"
 # Dataset
 # ============================================================
 case "$DATASET" in
-    lite)       TRACE_FILE="$DATA_DIR/lite_dataset.jsonl";      NUM_CONV=18 ;;
-    pcie-heavy) TRACE_FILE="$DATA_DIR/pcie_stress_heavy.jsonl"; NUM_CONV=40 ;;
-    *)          TRACE_FILE="$DATASET";                          NUM_CONV=40 ;;
+    lite)          TRACE_FILE="$DATA_DIR/lite_dataset.jsonl";         NUM_CONV=18 ;;
+    pcie-heavy)    TRACE_FILE="$DATA_DIR/pcie_stress_heavy.jsonl";    NUM_CONV=40 ;;
+    pcie-heavy-x5) TRACE_FILE="$DATA_DIR/pcie_stress_heavy_x5.jsonl"; NUM_CONV=200 ;;
+    *)             TRACE_FILE="$DATASET";                             NUM_CONV=40 ;;
 esac
+# --num-conv 参数可以覆盖默认 NUM_CONV (用于自定义 trace 文件)
+[[ -n "$NUM_CONV_OVERRIDE" ]] && NUM_CONV="$NUM_CONV_OVERRIDE"
 
 if [[ ! -f "$TRACE_FILE" ]]; then
     echo "FATAL: trace file not found: $TRACE_FILE"
@@ -240,6 +246,8 @@ start_vllm() {
 # Verify scheduler hooks were registered (critical sanity check)
 # ============================================================
 verify_hook_registration() {
+    # NOTE: Hook 是懒注册的, 在第一次 EPLB step 时才绑定 (大概是 workload
+    # 跑完若干请求之后), 所以这个检查必须在 run_workload 之后调用.
     local log_file="$1"
     local label="$2"
     local enable_eplb="$3"
@@ -257,8 +265,9 @@ verify_hook_registration() {
         log "  ✓ [$label] EPLB PCIe hooks 已注册"
         return 0
     else
-        log "  ✗ [$label] WARNING: 未发现 EPLB PCIe hooks registered 日志！"
-        log "      这通常意味着 EPLB 状态管理器与 connector 初始化时序问题"
+        log "  ✗ [$label] WARNING: workload 跑完仍未发现 EPLB PCIe hooks registered"
+        log "      若 jsonl 非空: 说明 EPLB 没触发 (step_interval 过大或 trace 太短)"
+        log "      若 jsonl 为空: 说明 hook binding 真失败了, 需要排查"
         return 1
     fi
 }

@@ -53,6 +53,7 @@ EPLB_STEP_INTERVAL=200
 PREFETCH_LEAD_TIME=2.0
 REQUEST_TIMEOUT=360
 DATASET="pcie-heavy"
+NUM_CONV_OVERRIDE=""               # 传入 --num-conv 时覆盖默认值
 QPS_LIST="0.5 1.0 1.5 2.0 2.5"
 RUN_GROUPS="g1,g2,g3,g4"
 ROUNDS=3
@@ -75,6 +76,8 @@ while [[ $# -gt 0 ]]; do
         --step-interval)    EPLB_STEP_INTERVAL="$2";    shift 2 ;;
         --ep-size)          EP_SIZE="$2";               shift 2 ;;
         --gpus)             GPU_LIST="$2";              shift 2 ;;
+        --dataset)          DATASET="$2";               shift 2 ;;
+        --num-conv)         NUM_CONV_OVERRIDE="$2";     shift 2 ;;
         --dry-run)          DRY_RUN=1;                  shift ;;
         -h|--help)
             sed -n '2,/^$/p' "$0" | grep '^#' | sed 's/^# \?//'
@@ -96,10 +99,13 @@ echo "========================================"
 # Dataset
 # ============================================================
 case "$DATASET" in
-    lite)       TRACE_FILE="$DATA_DIR/lite_dataset.jsonl";      NUM_CONV=18 ;;
-    pcie-heavy) TRACE_FILE="$DATA_DIR/pcie_stress_heavy.jsonl"; NUM_CONV=40 ;;
-    *)          TRACE_FILE="$DATASET";                          NUM_CONV=40 ;;
+    lite)          TRACE_FILE="$DATA_DIR/lite_dataset.jsonl";         NUM_CONV=18 ;;
+    pcie-heavy)    TRACE_FILE="$DATA_DIR/pcie_stress_heavy.jsonl";    NUM_CONV=40 ;;
+    pcie-heavy-x5) TRACE_FILE="$DATA_DIR/pcie_stress_heavy_x5.jsonl"; NUM_CONV=200 ;;
+    *)             TRACE_FILE="$DATASET";                             NUM_CONV=40 ;;
 esac
+# --num-conv 参数可以覆盖默认 NUM_CONV (用于自定义 trace 文件)
+[[ -n "$NUM_CONV_OVERRIDE" ]] && NUM_CONV="$NUM_CONV_OVERRIDE"
 
 if [[ ! -f "$TRACE_FILE" ]]; then
     echo "FATAL: trace file not found: $TRACE_FILE"
