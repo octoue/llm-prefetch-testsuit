@@ -1,6 +1,12 @@
 #!/bin/bash
 # ============================================================================
-# Serial experiment runner: sync/async × (Mixtral-8x7B | Phi-3.5-MoE)
+# Serial experiment runner: sync/async × (Mixtral-8x7B | DeepSeek-V2-Lite)
+#
+# NOTE: 原本计划用 Phi-3.5-MoE 作为第二模型, 但 vLLM 里的 PhiMoE 实现未绑定
+# MixtureOfExperts 接口 (`is_mixture_of_experts(model)` assert 失败), EPLB
+# 无法在 Phi 上运行. 替换为 DeepSeek-V2-Lite (16B / 2.4B activated, 64 routed
+# experts + 2 shared, top-6, MLA KV). 结构上跟 Mixtral 差异较大但能跑, 作为
+# "跨 MoE 架构泛化性"对照.
 #
 # 依次执行 4 组实验, 每组内部的 vLLM start/stop 由内层脚本
 # (run_mixtral_{sync,async}_fixed.sh) 自行管理. 本脚本负责:
@@ -15,7 +21,7 @@
 #
 # 可选参数:
 #   --only <list>     只跑指定实验, 逗号分隔:
-#                     sync_mixtral,sync_phi,async_mixtral,async_phi
+#                     sync_mixtral,sync_deepseek,async_mixtral,async_deepseek
 #                     例: --only "sync_mixtral,async_mixtral"
 #   --qps-list "..."  覆盖 QPS 列表 (default: "0.5 1.0 1.5 2.0 2.5")
 #   --rounds N        覆盖轮数 (default: 1)
@@ -36,12 +42,16 @@ API_PORT=8000
 RUN_ONLY="all"
 
 MIXTRAL_MODEL="/lpai/models/mistralai__mixtral-8x7b-instruct-v0_1/24-08-19-1318"
-PHI_MODEL="/lpai/models/microsoft__phi-3_5-moe-instruct/24-08-30-0107"
+DEEPSEEK_MODEL="/lpai/models/deepseek-ai__deepseek-v2-lite/24-05-17-0658"
 
-# Phi-3.5-MoE 专用参数 (A100-80GB 略保守防 OOM)
-PHI_GPU_MEM_UTIL=0.65
-PHI_NUM_GPU_BLOCKS=6000
-PHI_STEP_INTERVAL=100
+# DeepSeek-V2-Lite 专用参数 (A100-80GB)
+# 为什么跟 Mixtral 一致的 mem=0.5, step=200, 但 blocks 只有 2000:
+#   MLA 压缩 KV 后每 block 约 432 KB (Mixtral MHA 约 2 MB).
+#   把 blocks 减到 2000 以强制 evict/restore 活动, 补偿 MLA 的压缩,
+#   给 scheduler 制造足够的 KV 流量 vs EPLB rearrange 的竞争.
+DEEPSEEK_GPU_MEM_UTIL=0.5
+DEEPSEEK_NUM_GPU_BLOCKS=2000
+DEEPSEEK_STEP_INTERVAL=200
 
 # ---- Parse args -----------------------------------------------------------
 while [[ $# -gt 0 ]]; do
@@ -147,13 +157,13 @@ log "Rounds:         $ROUNDS"
 log "Run filter:     $RUN_ONLY"
 log "Results root:   $SERIAL_ROOT"
 log "Mixtral model:  $MIXTRAL_MODEL"
-log "Phi model:      $PHI_MODEL"
+log "DeepSeek model: $DEEPSEEK_MODEL"
 log ""
 log "Planned experiments:"
-log "  1. sync  + Mixtral-8x7B  (default params)"
-log "  2. sync  + Phi-3.5-MoE   (mem=$PHI_GPU_MEM_UTIL blocks=$PHI_NUM_GPU_BLOCKS step=$PHI_STEP_INTERVAL)"
-log "  3. async + Mixtral-8x7B  (default params)"
-log "  4. async + Phi-3.5-MoE   (mem=$PHI_GPU_MEM_UTIL blocks=$PHI_NUM_GPU_BLOCKS step=$PHI_STEP_INTERVAL)"
+log "  1. sync  + Mixtral-8x7B     (default params)"
+log "  2. sync  + DeepSeek-V2-Lite (mem=$DEEPSEEK_GPU_MEM_UTIL blocks=$DEEPSEEK_NUM_GPU_BLOCKS step=$DEEPSEEK_STEP_INTERVAL)"
+log "  3. async + Mixtral-8x7B     (default params)"
+log "  4. async + DeepSeek-V2-Lite (mem=$DEEPSEEK_GPU_MEM_UTIL blocks=$DEEPSEEK_NUM_GPU_BLOCKS step=$DEEPSEEK_STEP_INTERVAL)"
 
 OVERALL_START=$(date +%s)
 
@@ -164,15 +174,15 @@ run_experiment "sync_mixtral" \
         --qps-list "$QPS_LIST" \
         --rounds "$ROUNDS"
 
-export MODEL_PATH="$PHI_MODEL"
-run_experiment "sync_phi" \
+export MODEL_PATH="$DEEPSEEK_MODEL"
+run_experiment "sync_deepseek" \
     "$SYNC_SCRIPT" \
         --dataset "$DATASET" \
         --qps-list "$QPS_LIST" \
         --rounds "$ROUNDS" \
-        --gpu-mem-util "$PHI_GPU_MEM_UTIL" \
-        --num-gpu-blocks "$PHI_NUM_GPU_BLOCKS" \
-        --step-interval "$PHI_STEP_INTERVAL"
+        --gpu-mem-util "$DEEPSEEK_GPU_MEM_UTIL" \
+        --num-gpu-blocks "$DEEPSEEK_NUM_GPU_BLOCKS" \
+        --step-interval "$DEEPSEEK_STEP_INTERVAL"
 
 export MODEL_PATH="$MIXTRAL_MODEL"
 run_experiment "async_mixtral" \
@@ -181,15 +191,15 @@ run_experiment "async_mixtral" \
         --qps-list "$QPS_LIST" \
         --rounds "$ROUNDS"
 
-export MODEL_PATH="$PHI_MODEL"
-run_experiment "async_phi" \
+export MODEL_PATH="$DEEPSEEK_MODEL"
+run_experiment "async_deepseek" \
     "$ASYNC_SCRIPT" \
         --dataset "$DATASET" \
         --qps-list "$QPS_LIST" \
         --rounds "$ROUNDS" \
-        --gpu-mem-util "$PHI_GPU_MEM_UTIL" \
-        --num-gpu-blocks "$PHI_NUM_GPU_BLOCKS" \
-        --step-interval "$PHI_STEP_INTERVAL"
+        --gpu-mem-util "$DEEPSEEK_GPU_MEM_UTIL" \
+        --num-gpu-blocks "$DEEPSEEK_NUM_GPU_BLOCKS" \
+        --step-interval "$DEEPSEEK_STEP_INTERVAL"
 
 # ---- Summary --------------------------------------------------------------
 OVERALL_END=$(date +%s)
