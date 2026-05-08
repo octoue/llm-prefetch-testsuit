@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import random
 import statistics
 import time
@@ -33,8 +34,12 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-import tiktoken
 from openai import AsyncOpenAI
+
+try:
+    import tiktoken  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    tiktoken = None  # type: ignore
 
 
 WORD_POOL_SIZE = 10000
@@ -334,19 +339,132 @@ class StressRunner:
 # Workload drivers
 
 
-def _attack_messages(word_list, tokenizer, prefix_pool: list[str], idx: int):
-    """Pick a base prefix and append a unique-ish suffix token.
+def _build_attack_prefix_pool(
+    path: str,
+    word_list: list[str],
+    tokenizer,
+    input_token_budget: int,
+    max_prefixes: int | None = None,
+) -> list[list[dict]]:
+    """Build attack prefixes as proper multi-turn messages arrays.
 
-    Each call produces a slightly different conversation so the prefetch path
-    enters allocation rather than instantly hitting the prefix cache, while
-    still being cheap to construct.
+    Each pool entry is a list of OpenAI-style ``{role, content}`` messages
+    that mirrors *exactly* the structure ``prefetch_ab_runner.py`` builds
+    for a real prefetch at the deepest turn of a conversation chain:
+
+        [user_1, assistant_1, user_2, assistant_2, ..., user_k]
+
+    Sending this through the chat-completion endpoint goes through the same
+    chat template as the benign path, producing the same token sequence —
+    so prefix-cache behaviour during S1 matches that of the benign trace
+    instead of being a flattened, unrelated string.
+
+    Two input formats are accepted:
+
+    1. **Real metadata trace** (default; same file S2/S3 use, e.g.
+       ``pcie_stress_heavy.jsonl``). For every multi-turn chain we
+       synthesise the cumulative history through its deepest turn using
+       the same word-pool rule as ``prefetch_ab_runner.py`` (input_length
+       drives user-message size, output_length drives placeholder
+       assistant-message size, capped at 256 tokens).
+    2. **Content JSONL** (legacy ``synth_attack_prefix_8k.jsonl``): each
+       entry becomes a single-turn ``[{user, content}]`` array, used only
+       for the "trace-derived vs fully-synthetic" ablation.
+
+    The runner adds a unique per-iteration suffix to the last user message
+    (see ``_attack_messages``) so each attack lands a small fresh tail
+    past the matched prefix, forcing actual block allocation regardless
+    of cache state.
+    """
+    pool: list[list[dict]] = []
+    if not path:
+        return pool
+    with open(path, "r", encoding="utf-8") as f:
+        first_line = f.readline().strip()
+    if not first_line:
+        return pool
+    first = json.loads(first_line)
+    has_content = any(k in first for k in ("content", "prefix", "text"))
+    has_trace = "chat_id" in first and "input_length" in first
+
+    if has_content:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                content = rec.get("content") or rec.get("prefix") or rec.get("text")
+                if content:
+                    pool.append([{"role": "user", "content": content}])
+    elif has_trace:
+        records = _load_trace(path)
+        chains = _build_chains(records)
+        for chain in chains:
+            messages: list[dict] = []
+            for record in chain:
+                user_tokens = max(
+                    10, record.get("input_length", 0) - input_token_budget
+                )
+                user_msg = _gen_text(word_list, user_tokens, tokenizer)
+                messages.append({"role": "user", "content": user_msg})
+                if record is not chain[-1]:
+                    # Placeholder assistant turn between user turns; size it
+                    # against the recorded output_length, capped to keep the
+                    # prefix manageable.
+                    output_tokens = min(record.get("output_length", 64), 256)
+                    placeholder = _gen_text(word_list, output_tokens, tokenizer)
+                    messages.append(
+                        {"role": "assistant", "content": placeholder}
+                    )
+            if messages:
+                pool.append(messages)
+    else:
+        raise SystemExit(
+            f"--attack-prefix-file {path}: cannot recognise schema; "
+            "expected content/prefix/text or chat_id/input_length keys"
+        )
+
+    if max_prefixes is not None and len(pool) > max_prefixes:
+        pool = pool[:max_prefixes]
+    return pool
+
+
+def _attack_messages(
+    word_list: list[str],
+    tokenizer,
+    prefix_pool: list[list[dict]],
+    idx: int,
+) -> list[dict]:
+    """Render a multi-turn attack request for iteration ``idx``.
+
+    Picks a base messages array from the pool (cycling), then **appends a
+    unique ~24-token suffix to the final user message** so that:
+
+      - the leading turns hit the GPU / CPU prefix cache when revisiting
+        a previously-seen chain (matching the benign-path behaviour);
+      - the trailing suffix never matches anything, forcing the engine
+        to allocate fresh blocks and exercise the admission-control,
+        quota and TTL paths the experiment is designed to measure.
     """
     base = prefix_pool[idx % len(prefix_pool)]
-    suffix = COMMON_WORDS[(idx * 7919) % len(COMMON_WORDS)]
-    return [{"role": "user", "content": f"{base} {suffix}"}]
+    suffix_text = _gen_text(word_list, 24, tokenizer) + f" idx{idx}"
+    if not base:
+        return [{"role": "user", "content": suffix_text}]
+    out = [dict(m) for m in base[:-1]]
+    last = dict(base[-1])
+    if last.get("role") == "user":
+        last["content"] = f"{last['content']} {suffix_text}"
+        out.append(last)
+    else:
+        # Defensive: chains always end with a user turn, but if not we
+        # add the suffix as a fresh user turn.
+        out.append(last)
+        out.append({"role": "user", "content": suffix_text})
+    return out
 
 
-async def run_s1(args, runner: StressRunner, prefix_pool: list[str]):
+async def run_s1(args, runner: StressRunner, prefix_pool: list[list[dict]]):
     interval = 1.0 / max(args.prefetch_qps, 1e-6)
     deadline = time.time() + args.duration_sec
     pending: list[asyncio.Task] = []
@@ -375,34 +493,63 @@ async def run_s1(args, runner: StressRunner, prefix_pool: list[str]):
 
 
 async def run_s2(args, runner: StressRunner, chains: list[list[dict]]):
+    """S2 = user mis-click burst.
+
+    Each "user" walks a real-trace chain. At any turn that has prior history
+    we issue ``--burst-size`` prefetch requests (each with a unique tail
+    suffix so the engine has to allocate fresh tail blocks past the cached
+    prefix), then with probability ``--abandon-prob`` we drop the rest of
+    the chain *without* sending any real inference. This matches the
+    reviewer's definition of misclick: "大量预取被触发但最终未提交请求".
+
+    With ``--abandon-prob=1.0`` (the default) every chain abandons after
+    its first burst, so no prefetch ever leads to a real inference. Set
+    ``--abandon-prob=0`` to recover the legacy "burst then commit" mode
+    used for "user hesitates but ultimately submits" experiments.
+
+    Chains are cycled via ``itertools.cycle`` so the experiment always
+    runs for the full ``--duration-sec`` regardless of trace size.
+    """
+    import itertools
+
     burst_n = args.burst_size
     burst_gap = args.burst_interval_ms / 1000.0
+    abandon_prob = args.abandon_prob
     deadline = time.time() + args.duration_sec
     interval = 1.0 / max(args.qps, 1e-6)
     next_send = time.time()
     tasks: list[asyncio.Task] = []
-    chain_iter = iter(chains)
+    chain_iter = itertools.cycle(chains) if chains else iter(())
+    chain_seq = 0
 
-    async def _process_chain(chain: list[dict]):
+    async def _process_chain(chain: list[dict], seq: int):
         history: list[dict] = []
         for record in chain:
             if time.time() > deadline:
                 return
             chat_id = record["chat_id"]
             turn = record["turn"]
-            if history:
+            if history and burst_n > 0:
                 msgs_for_prefetch = history.copy()
-                # Burst prefetches; each carries a tiny suffix perturbation
-                # so the engine treats them as distinct allocations.
                 for k in range(burst_n):
+                    # Unique tail per burst so each prefetch lands a fresh
+                    # tail allocation past the (typically cached) history
+                    # prefix.
+                    tail = f"misclick {seq}.{k} " + _gen_text(
+                        runner.word_list, 16, runner.tokenizer
+                    )
                     msgs = msgs_for_prefetch + [
-                        {"role": "user", "content": f"misclick-{k}"}
+                        {"role": "user", "content": tail}
                     ]
                     await runner.send_prefetch(
                         msgs, tag="s2_burst", chat_id=chat_id, turn=turn
                     )
                     if k < burst_n - 1:
                         await asyncio.sleep(burst_gap)
+                # After the burst, decide whether to abandon. Default:
+                # always abandon (matches reviewer's "未提交请求").
+                if random.random() < abandon_prob:
+                    return
             user_tokens = max(10, record["input_length"] - args.input_token_budget)
             user_msg = _gen_text(runner.word_list, user_tokens, runner.tokenizer)
             history.append({"role": "user", "content": user_msg})
@@ -431,7 +578,9 @@ async def run_s2(args, runner: StressRunner, chains: list[list[dict]]):
             chain = next(chain_iter)
         except StopIteration:
             break
-        tasks.append(asyncio.create_task(_process_chain(chain)))
+        seq = chain_seq
+        chain_seq += 1
+        tasks.append(asyncio.create_task(_process_chain(chain, seq)))
         next_send += interval
         wait = next_send - time.time()
         if wait > 0:
@@ -462,32 +611,75 @@ async def run_s3(args, runner: StressRunner, chains, prefix_pool):
 # Entry point
 
 
+def _resolve_tokenizer(model: str):
+    """Pick a tokenizer for ``_gen_text`` length sizing.
+
+    Priority (offline-friendly, no internet required):
+      1. ``transformers.AutoTokenizer.from_pretrained(model, local_files_only=True)``
+         when ``model`` is a local path. Matches what vLLM itself uses and
+         is always available because the model directory is on disk.
+      2. ``tiktoken.get_encoding("cl100k_base")`` if a cached BPE blob is
+         already present on disk (``TIKTOKEN_CACHE_DIR`` or
+         ``/tmp/data-gym-cache``). Only succeeds when populated previously.
+      3. ``None`` — ``_gen_text`` falls back to a word-count heuristic
+         (consistent with ``prefetch_ab_runner.py``'s tokenizer-failure
+         path). Length precision degrades by ~10%, acceptable for stress
+         experiments.
+
+    Returns an object exposing ``.encode(text) -> list[int]``; for HF
+    tokenizers we wrap it to suppress special tokens during length counts.
+    """
+    if model and os.path.isdir(model):
+        try:
+            from transformers import AutoTokenizer  # type: ignore
+
+            hf_tok = AutoTokenizer.from_pretrained(
+                model, local_files_only=True, trust_remote_code=True
+            )
+
+            class _HFAdapter:
+                def encode(self, text: str) -> list[int]:
+                    return hf_tok.encode(text, add_special_tokens=False)
+
+            print(f"[tokenizer] using local HF tokenizer at {model}")
+            return _HFAdapter()
+        except Exception as e:
+            print(f"[tokenizer] HF load failed ({e}); trying tiktoken")
+
+    if tiktoken is not None:
+        try:
+            tk = tiktoken.get_encoding("cl100k_base")
+            print("[tokenizer] using tiktoken cl100k_base (cached)")
+            return tk
+        except Exception as e:
+            print(f"[tokenizer] tiktoken unavailable ({e}); using heuristic")
+
+    print("[tokenizer] using len//4 heuristic (no tokenizer available)")
+    return None
+
+
 async def main_async(args: argparse.Namespace) -> None:
     word_list = _build_word_list(args.seed)
-    try:
-        tokenizer = tiktoken.get_encoding("cl100k_base")
-    except Exception:
-        tokenizer = None
+    tokenizer = _resolve_tokenizer(args.model)
 
-    prefix_pool: list[str] = []
+    prefix_pool: list[list[dict]] = []
     if args.scenario in ("s1", "s3"):
-        if not args.attack_prefix_file:
+        attack_src = args.attack_prefix_file or args.bg_trace_file
+        if not attack_src:
             raise SystemExit(
-                "--attack-prefix-file is required for s1/s3 (use "
-                "data/synth_attack_prefix_8k.jsonl or similar)"
+                "--attack-prefix-file or --bg-trace-file must be provided "
+                "for s1/s3 (typically the same heavy trace used for S2/S3)"
             )
-        with open(args.attack_prefix_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                rec = json.loads(line)
-                content = rec.get("content") or rec.get("prefix") or rec.get("text")
-                if content:
-                    prefix_pool.append(content)
+        prefix_pool = _build_attack_prefix_pool(
+            attack_src,
+            word_list,
+            tokenizer,
+            input_token_budget=args.input_token_budget,
+            max_prefixes=args.max_attack_prefixes,
+        )
         if not prefix_pool:
             raise SystemExit(
-                f"No usable entries in attack prefix file {args.attack_prefix_file}"
+                f"No usable entries derived from attack source {attack_src}"
             )
 
     chains: list[list[dict]] = []
@@ -593,13 +785,35 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--attack-prefix-file",
         default="",
-        help="JSONL with 'content' (or 'prefix' / 'text') fields for S1/S3",
+        help=(
+            "JSONL source for S1/S3 prefixes. Accepts either a metadata "
+            "trace (same format as the heavy/optimal datasets, e.g. "
+            "pcie_stress_heavy.jsonl) or a content JSONL with content/"
+            "prefix/text fields. If omitted, falls back to --bg-trace-file."
+        ),
+    )
+    p.add_argument(
+        "--max-attack-prefixes",
+        type=int,
+        default=None,
+        help="Cap the prefix pool size after derivation (default: all).",
     )
     # S2 / S3
     p.add_argument("--bg-trace-file", default="")
     p.add_argument("--qps", type=float, default=1.0, help="benign trace QPS")
     p.add_argument("--burst-size", type=int, default=5)
     p.add_argument("--burst-interval-ms", type=int, default=50)
+    p.add_argument(
+        "--abandon-prob",
+        type=float,
+        default=1.0,
+        help=(
+            "Probability that a chain in S2 is abandoned after each burst "
+            "(no follow-up real inference). 1.0 = pure misclick (matches "
+            "reviewer's '大量预取被触发但最终未提交请求'); 0.0 = always "
+            "commit (legacy 'hesitate then submit')."
+        ),
+    )
     p.add_argument("--max-output-tokens", type=int, default=128)
     p.add_argument("--input-token-budget", type=int, default=512)
     p.add_argument(

@@ -13,11 +13,14 @@ counters already wired in this branch).
 # Build / install the patched vLLM (or activate an existing venv).
 cd /path/to/vllm && pip install -e .
 
-# Generate the long-prefix templates used by S1/S3.
-cd /path/to/llm-prefetch-testsuit
-python3 data/generate_attack_prefixes.py \
-    --output data/synth_attack_prefix_8k.jsonl \
-    --num 30 --target-tokens 7800
+# S1 attack prefixes are derived from the same real-trace metadata that
+# S2/S3 use (pcie_stress_heavy.jsonl by default), so no separate dataset
+# generation is required. The optional generator below produces a fully
+# synthetic baseline only for ablation against the metadata-derived path.
+#
+# python3 data/generate_attack_prefixes.py \
+#     --output data/synth_attack_prefix_8k.jsonl \
+#     --num 30 --target-tokens 7800
 
 # (Optional) tune kernel for low-latency / disable extraneous GPU users.
 sudo tuned-adm profile latency-performance || true
@@ -77,8 +80,13 @@ done
 
 ## 4. E3 — S2 misclick burst + TTL ablation (mandatory)
 
+By default the runner runs S2 with ``--abandon-prob=1.0`` so each chain is
+abandoned after its prefetch burst (no real inference at all). This matches
+the reviewer's wording "大量预取被触发但最终未提交请求". To test the
+"hesitate-then-commit" variant instead, set ``ABANDON_PROB=0``.
+
 ```bash
-# Default: TTL=60s, sweep N.
+# Default: TTL=60s, abandon=1.0, sweep N.
 BURST_SIZE_LIST="2 5 10" TTL_LIST="60000" REPEAT=3 \
   bash scripts/stress/run_stress_s2.sh
 
@@ -88,6 +96,10 @@ STRESS_PREFETCH_TTL_MS=0 \
   bash scripts/stress/start_vllm_stress.sh --ttl-ms 0 &
 BURST_SIZE_LIST="2 5 10" TTL_LIST="0" REPEAT=3 \
   bash scripts/stress/run_stress_s2.sh "results/stress/e3_ttl0"
+
+# Optional: legacy "hesitate then commit" variant.
+ABANDON_PROB=0 BURST_SIZE_LIST="5" REPEAT=3 \
+  bash scripts/stress/run_stress_s2.sh "results/stress/e3_commit"
 ```
 
 ## 5. E4 — S3 mixed background (mandatory)

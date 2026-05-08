@@ -16,8 +16,12 @@ UTILS_DIR="$RUN_EXP_DIR/scripts/utils"
 API_PORT="${API_PORT:-8000}"
 API_BASE="${API_BASE:-http://localhost:${API_PORT}/v1}"
 MODEL="${STRESS_MODEL:-${MODEL_PATH}}"
+# S2/S3 background and S1 attack share the same real metadata trace by
+# default; the runner derives attack prefixes from its multi-turn structure.
+# Override ATTACK_PREFIX_FILE to point at a content JSONL for fully synthetic
+# baselines (rare; mostly for ablation against the metadata-derived path).
 DEFAULT_BG_TRACE="${DATA_ROOT:-$TESTSUIT_ROOT/data}/pcie_stress_heavy.jsonl"
-DEFAULT_ATTACK_PREFIX="${DATA_ROOT:-$TESTSUIT_ROOT/data}/synth_attack_prefix_8k.jsonl"
+DEFAULT_ATTACK_PREFIX="$DEFAULT_BG_TRACE"
 
 # Run the requested stress scenario together with power / pcie sampling,
 # producing a self-contained results directory.
@@ -66,7 +70,8 @@ run_one_unit() {
       extra_args+=( --bg-trace-file "${BG_TRACE_FILE:-$DEFAULT_BG_TRACE}" \
                     --qps "${QPS:-1.0}" \
                     --burst-size "${BURST_SIZE:-5}" \
-                    --burst-interval-ms "${BURST_INTERVAL_MS:-50}" )
+                    --burst-interval-ms "${BURST_INTERVAL_MS:-50}" \
+                    --abandon-prob "${ABANDON_PROB:-1.0}" )
       ;;
     s3)
       extra_args+=( --bg-trace-file "${BG_TRACE_FILE:-$DEFAULT_BG_TRACE}" \

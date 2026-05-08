@@ -112,21 +112,71 @@ def cpu_energy_j(unit_dir: Path) -> float | None:
 
 
 def pcie_stats(unit_dir: Path) -> dict:
+    """Aggregate Prefetch H2D events for the run.
+
+    In addition to total bytes / count, derive PCIe wake-up indicators
+    from the inter-event gap distribution:
+
+      - ``gap_p50_us`` / ``gap_p95_us`` — median/p95 inter-event gap.
+      - ``short_gap_ratio`` — fraction of events whose gap to the
+        previous Prefetch is < 100 us. ASPM L0s/L1 wake latencies are in
+        the few-to-tens-of-microseconds range, so a high short-gap ratio
+        means the link rarely had a chance to enter a low-power state.
+      - ``avg_event_bw_mbps`` — average link bandwidth used by Prefetch
+        traffic over the wall-clock window covered by the events.
+
+    Wall-clock is approximated by the span between the first and last
+    event's ``start_us``. For very low event counts these stats degrade
+    gracefully.
+    """
     path = unit_dir / "pcie_events.json"
+    out = {
+        "prefetch_bytes": 0,
+        "prefetch_count": 0,
+        "gap_p50_us": None,
+        "gap_p95_us": None,
+        "short_gap_ratio": None,
+        "avg_event_bw_mbps": None,
+    }
     if not path.exists():
-        return {"prefetch_bytes": 0, "prefetch_count": 0}
+        return out
     try:
         events = json.loads(path.read_text())
     except Exception:
-        return {"prefetch_bytes": 0, "prefetch_count": 0}
-    bytes_sum = 0
-    count = 0
-    for ev in events:
-        if ev.get("op_type") != "Prefetch":
-            continue
-        bytes_sum += int(ev.get("wire_bytes") or ev.get("size_bytes") or 0)
-        count += 1
-    return {"prefetch_bytes": bytes_sum, "prefetch_count": count}
+        return out
+
+    pf = [ev for ev in events if ev.get("op_type") == "Prefetch"]
+    if not pf:
+        return out
+
+    pf.sort(key=lambda e: float(e.get("start_us", 0)))
+    bytes_sum = sum(
+        int(ev.get("wire_bytes") or ev.get("size_bytes") or 0) for ev in pf
+    )
+    out["prefetch_bytes"] = bytes_sum
+    out["prefetch_count"] = len(pf)
+
+    if len(pf) >= 2:
+        gaps_us: list[float] = []
+        for i in range(1, len(pf)):
+            prev_end = float(pf[i - 1].get("end_us", pf[i - 1].get("start_us", 0)))
+            cur_start = float(pf[i].get("start_us", 0))
+            gap = cur_start - prev_end
+            if gap >= 0:
+                gaps_us.append(gap)
+        if gaps_us:
+            gaps_sorted = sorted(gaps_us)
+            out["gap_p50_us"] = gaps_sorted[len(gaps_sorted) // 2]
+            p95_idx = max(0, int(0.95 * len(gaps_sorted)) - 1)
+            out["gap_p95_us"] = gaps_sorted[p95_idx]
+            short = sum(1 for g in gaps_sorted if g < 100.0)
+            out["short_gap_ratio"] = short / len(gaps_sorted)
+
+        span_us = float(pf[-1].get("start_us", 0)) - float(pf[0].get("start_us", 0))
+        if span_us > 0:
+            out["avg_event_bw_mbps"] = (bytes_sum / (1024 * 1024)) / (span_us / 1e6)
+
+    return out
 
 
 def prom_deltas(samples: list[dict]) -> dict:
@@ -169,8 +219,19 @@ def aggregate(units: list[dict]) -> list[dict]:
             + deltas["deferred"]
             + deltas["expired"]
         )
-        wasted = deltas["no_hits"] + deltas["expired"]
-        wasted_ratio = (wasted / attempts) if attempts > 0 else 0.0
+        # Two complementary "wasted" views:
+        #   wasted_attempt_ratio: of all prefetch attempts the engine saw,
+        #     what fraction ended up benefiting nobody (no_hits = nothing
+        #     to load; expired = loaded then never consumed).
+        #   wasted_byte_estimate: prefetch_expired blocks correspond to
+        #     bytes that were transferred over PCIe and then reclaimed
+        #     without being touched. We don't know exact bytes per block
+        #     without server-side accounting, so we report the count and
+        #     leave the byte-level estimate for the analysis writeup.
+        wasted_attempts = deltas["no_hits"] + deltas["expired"]
+        wasted_attempt_ratio = (
+            wasted_attempts / attempts if attempts > 0 else 0.0
+        )
 
         latency = summary.get("real_latency_ms", {}) or {}
         rows.append(
@@ -188,12 +249,17 @@ def aggregate(units: list[dict]) -> list[dict]:
                 "cpu_energy_j": cpu_j,
                 "pcie_prefetch_bytes": pcie["prefetch_bytes"],
                 "pcie_prefetch_events": pcie["prefetch_count"],
+                "pcie_gap_p50_us": pcie["gap_p50_us"],
+                "pcie_gap_p95_us": pcie["gap_p95_us"],
+                "pcie_short_gap_ratio": pcie["short_gap_ratio"],
+                "pcie_avg_event_bw_mbps": pcie["avg_event_bw_mbps"],
                 "prom_gpu_hits": deltas["gpu_hits"],
                 "prom_cpu_hits": deltas["cpu_hits"],
                 "prom_no_hits": deltas["no_hits"],
                 "prom_deferred": deltas["deferred"],
                 "prom_expired": deltas["expired"],
-                "wasted_ratio": wasted_ratio,
+                "wasted_attempts": wasted_attempts,
+                "wasted_attempt_ratio": wasted_attempt_ratio,
                 "real_ttft_mean_ms": latency.get("ttft_mean"),
                 "real_ttft_p95_ms": latency.get("ttft_p95"),
                 "real_tpot_mean_ms": latency.get("tpot_mean"),
@@ -243,6 +309,59 @@ def plot_wasted_io(rows: list[dict], out: Path) -> None:
     ax.set_xticklabels(xs, rotation=60, ha="right", fontsize=7)
     ax.set_ylabel("Prefetch H2D bytes (GiB, total during window)")
     ax.set_title("Stress: Prefetch PCIe traffic per unit")
+    fig.tight_layout()
+    fig.savefig(out)
+    plt.close(fig)
+
+
+def plot_pcie_gap_cdf(units: list[dict], out: Path) -> None:
+    """CDF of inter-Prefetch-event gaps per unit.
+
+    Useful for the 'PCIe 唤醒' argument: a curve hugging the y-axis (most
+    gaps very short) means the link basically never sleeps; a curve
+    shifted to the right means transfers are spaced enough that ASPM
+    can take effect between them.
+    """
+    fig, ax = plt.subplots(figsize=(6, 4))
+    plotted = 0
+    for u in units:
+        unit_dir = u["dir"]
+        path = unit_dir / "pcie_events.json"
+        if not path.exists():
+            continue
+        try:
+            events = json.loads(path.read_text())
+        except Exception:
+            continue
+        pf = [ev for ev in events if ev.get("op_type") == "Prefetch"]
+        if len(pf) < 2:
+            continue
+        pf.sort(key=lambda e: float(e.get("start_us", 0)))
+        gaps = []
+        for i in range(1, len(pf)):
+            prev_end = float(
+                pf[i - 1].get("end_us", pf[i - 1].get("start_us", 0))
+            )
+            cur_start = float(pf[i].get("start_us", 0))
+            gap = cur_start - prev_end
+            if gap >= 0:
+                gaps.append(gap)
+        if not gaps:
+            continue
+        gaps.sort()
+        ys = [(i + 1) / len(gaps) for i in range(len(gaps))]
+        ax.plot(gaps, ys, label=unit_dir.name)
+        plotted += 1
+    if plotted == 0:
+        plt.close(fig)
+        return
+    ax.set_xscale("log")
+    ax.set_xlabel("Inter-Prefetch gap (μs, log scale)")
+    ax.set_ylabel("CDF")
+    ax.set_title("Stress: PCIe wake-up gap distribution")
+    ax.axvline(100.0, color="grey", linestyle="--", linewidth=0.8,
+               label="ASPM threshold (100 μs)")
+    ax.legend(fontsize=7)
     fig.tight_layout()
     fig.savefig(out)
     plt.close(fig)
@@ -308,6 +427,7 @@ def main() -> None:
     figs.mkdir(exist_ok=True)
     plot_power(rows, figs / "power_curve.pdf")
     plot_wasted_io(rows, figs / "wasted_io.pdf")
+    plot_pcie_gap_cdf(units, figs / "pcie_gap_cdf.pdf")
     plot_ttft_cdf(units, figs / "ttft_cdf.pdf")
     print(f"wrote {len(rows)} rows -> {root / 'aggregate.csv'}")
 
