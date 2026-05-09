@@ -34,6 +34,7 @@
 #   STRESS_PP                    pipeline-parallel size (default = system.env)
 #   STRESS_BLOCK_RATIO           --max-prefetch-block-ratio (default 0.3)
 #   STRESS_PREFETCH_TTL_MS       --prefetch-ttl-ms          (default 60000)
+#   STRESS_PREFETCH_RATE_LIMIT   API-layer prefetch rate limit req/s (default 0=off)
 #   GPU_WAIT_TIMEOUT             seconds to wait for free GPUs (0 = forever)
 
 set -e
@@ -54,6 +55,7 @@ TP="${STRESS_TP:-${VLLM_TENSOR_PARALLEL_SIZE:-1}}"
 PP="${STRESS_PP:-${VLLM_PIPELINE_PARALLEL_SIZE:-2}}"
 RATIO="${STRESS_BLOCK_RATIO:-0.3}"
 TTL_MS="${STRESS_PREFETCH_TTL_MS:-60000}"
+PREFETCH_RATE_LIMIT="${STRESS_PREFETCH_RATE_LIMIT:-0}"
 PORT="${API_PORT:-8000}"
 LOG_FILE="${RUN_EXP_DIR}/results/stress/vllm_stress.log"
 
@@ -63,6 +65,7 @@ while [[ $# -gt 0 ]]; do
     --pp) PP="$2"; shift 2 ;;
     --ratio) RATIO="$2"; shift 2 ;;
     --ttl-ms) TTL_MS="$2"; shift 2 ;;
+    --rate-limit) PREFETCH_RATE_LIMIT="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
     --log) LOG_FILE="$2"; shift 2 ;;
     *) shift ;;
@@ -100,12 +103,14 @@ echo "  GPUs      = $FREE_GPUS  (tp=$TP, pp=$PP, total=$NUM_GPUS)"
 echo "  port      = $PORT"
 echo "  ratio     = $RATIO"
 echo "  ttl_ms    = $TTL_MS"
+echo "  rate_limit= $PREFETCH_RATE_LIMIT req/s"
 echo "  GPU_MEMORY_UTILIZATION=$GPU_MEMORY_UTILIZATION"
 echo "  NUM_GPU_BLOCKS_OVERRIDE=$NUM_GPU_BLOCKS_OVERRIDE"
 echo "  KV_OFFLOADING_SIZE=${KV_OFFLOADING_SIZE}, SWAP_SPACE=${SWAP_SPACE}"
 echo "============================================"
 
 export VLLM_PCIE_TRACE=1
+export VLLM_PREFETCH_RATE_LIMIT="$PREFETCH_RATE_LIMIT"
 export VLLM_LOGGING_LEVEL="${VLLM_LOG_LEVEL:-INFO}"
 
 CMD_ARGS=(

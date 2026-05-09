@@ -15,7 +15,10 @@
 #   S1 QPS=200 x3                    comparison: quota is necessary
 #   S2 burst=5 x3                    comparison: TTL is necessary
 #
-# Total: 21 runs x ~6 min = ~2.5 hours.
+# Phase 3  PROTECTED + RATE LIMIT  (ratio=0.3, TTL=60s, rate_limit=10)
+#   S1 QPS=200 x3                    proves rate limit eliminates scheduler flooding
+#
+# Total: 24 runs x ~6 min = ~2.5 hours.
 #
 # Usage:
 #   cd llm-prefetch-testsuit/run-experiment
@@ -43,16 +46,17 @@ export DURATION_SEC="${DURATION_SEC:-300}"
 SERVER_PID=""
 
 start_server() {
-  local ratio="$1" ttl_ms="$2"
-  local log="$ROOT/vllm_ratio${ratio}_ttl${ttl_ms}.log"
+  local ratio="$1" ttl_ms="$2" rate_limit="${3:-0}"
+  local log="$ROOT/vllm_ratio${ratio}_ttl${ttl_ms}_rl${rate_limit}.log"
 
   echo ""
   echo "================================================================"
-  echo "  Starting vLLM   ratio=$ratio  ttl_ms=$ttl_ms"
+  echo "  Starting vLLM   ratio=$ratio  ttl_ms=$ttl_ms  rate_limit=$rate_limit"
   echo "================================================================"
 
   bash "$SCRIPT_DIR/start_vllm_stress.sh" \
-       --ratio "$ratio" --ttl-ms "$ttl_ms" --log "$log" &
+       --ratio "$ratio" --ttl-ms "$ttl_ms" --rate-limit "$rate_limit" \
+       --log "$log" &
   SERVER_PID=$!
 
   local w=0
@@ -149,6 +153,24 @@ done
 stop_server
 
 # ───────────────────────────────────────────────────────
+#  Phase 3: Protected + API rate limit (defense complete)
+# ───────────────────────────────────────────────────────
+RATE_LIMIT="${PREFETCH_RATE_LIMIT:-10}"
+start_server 0.3 60000 "$RATE_LIMIT"
+
+echo ""
+echo "===== Phase 3: PROTECTED + RATE LIMIT (${RATE_LIMIT} req/s) ====="
+
+# S1 at QPS=200: rate limiter should absorb flood,
+# baseline TTFT should match no-attack baseline.
+for r in $(seq 1 "$REPEAT"); do
+  PREFETCH_QPS=200 \
+    run_one_unit "$ROOT/ratelimit_s1_qps200_rep${r}" s1
+done
+
+stop_server
+
+# ───────────────────────────────────────────────────────
 #  Analysis
 # ───────────────────────────────────────────────────────
 echo ""
@@ -167,3 +189,4 @@ echo "  1. protected s1 qps 50/200/800  ->  overhead saturates"
 echo "  2. protected vs unprotected s1 qps200  ->  quota bounds overhead"
 echo "  3. protected vs unprotected s2  ->  TTL prevents waste accumulation"
 echo "  4. protected s3  ->  real TTFT p95 degradation < 20%"
+echo "  5. ratelimit s1 qps200 vs protected s1 qps200  ->  rate limit eliminates scheduler flooding"
