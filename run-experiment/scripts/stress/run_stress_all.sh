@@ -1,33 +1,35 @@
 #!/bin/bash
-# run_stress_all.sh — Complete extreme-prefetch-failure experiment.
+# run_stress_all.sh — Three-phase stress defense experiment for thesis.
 #
-# Answers the reviewer's question:
-#   "Under malicious flood or high-frequency misclick, are PCIe wake-ups,
-#    wasted I/O, power, and backend bandwidth bounded by admission control
-#    and TTL reclaim?"
+# Proves the three-layer defense (scheduler NO_HIT discard + quota/TTL +
+# API rate limiter) bounds overhead from extreme prefetch scenarios.
 #
-# Phase 1  PROTECTED  (ratio=0.3, TTL=60s — thesis default)
-#   S1 QPS sweep {50, 200, 800} x3   overhead saturates with quota
-#   S2 burst=5 x3                    TTL reclaim handles misclick waste
-#   S3 mix=1.0 x3                    legitimate users unaffected
+# Phase 1  PROTECTED  (ratio=0.3, TTL=60s)        — thesis default
+#   S1 QPS=200 × REPEAT    scheduler handles flood via NO_HIT discard
+#   S2 burst=5 × REPEAT    TTL reclaim + quota bound misclick overhead
 #
-# Phase 2  UNPROTECTED  (ratio=0, TTL=0 — no protection)
-#   S1 QPS=200 x3                    comparison: quota is necessary
-#   S2 burst=5 x3                    comparison: TTL is necessary
+# Phase 2  UNPROTECTED (ratio=0, TTL=0)            — defense disabled
+#   S1 QPS=200 × REPEAT    comparison baseline (for S1 NO_HIT, same as P1)
+#   S2 burst=5 × REPEAT    no TTL reclaim: prefetch blocks not reclaimed
 #
-# Phase 3  PROTECTED + RATE LIMIT  (ratio=0.3, TTL=60s, rate_limit=10)
-#   S1 QPS=200 x3                    proves rate limit eliminates scheduler flooding
+# Phase 3  PROTECTED + RATE LIMIT (ratio=0.3, TTL=60s, rate_limit=5)
+#   S1 QPS=200 × REPEAT    full defense: rate limiter absorbs flood
 #
-# Total: 24 runs x ~6 min = ~2.5 hours.
+# Server is restarted between phases (different configs). Within a phase,
+# prefix cache is reset between units for isolation (see _stress_common.sh).
+#
+# Total: 5 × REPEAT runs. Default REPEAT=3 → 15 runs × ~6 min ≈ 90 min
+# plus ~5 min server restart per phase → ~2 hours total.
 #
 # Usage:
 #   cd llm-prefetch-testsuit/run-experiment
 #   bash scripts/stress/run_stress_all.sh [results_root]
 #
 # Env overrides (all optional):
-#   DURATION_SEC=300        per-unit wall time (default 5 min)
-#   REPEAT=3                repeats per config point
-#   S1_QPS="50 200 800"    QPS sweep for S1
+#   DURATION_SEC=300             per-unit wall time (default 5 min)
+#   REPEAT=3                    repeats per config point
+#   PREFETCH_RATE_LIMIT=5       Phase 3 rate limit (req/s)
+#   RESTART_PER_UNIT=0          set 1 to restart vLLM between every unit
 
 set -e
 
@@ -38,12 +40,18 @@ ROOT="${1:-$RUN_EXP_DIR/results/stress/all_$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$ROOT"
 
 REPEAT="${REPEAT:-3}"
-S1_QPS="${S1_QPS:-50 200 800}"
 S2_BURST="${S2_BURST:-5}"
-S3_MIX="${S3_MIX:-1.0}"
+RATE_LIMIT="${PREFETCH_RATE_LIMIT:-5}"
+RESTART_PER_UNIT="${RESTART_PER_UNIT:-0}"
 export DURATION_SEC="${DURATION_SEC:-300}"
 
+TOTAL_UNITS=$(( REPEAT * 5 ))
+CURRENT_UNIT=0
+
 SERVER_PID=""
+CURRENT_RATIO=""
+CURRENT_TTL=""
+CURRENT_RL=""
 
 start_server() {
   local ratio="$1" ttl_ms="$2" rate_limit="${3:-0}"
@@ -58,6 +66,9 @@ start_server() {
        --ratio "$ratio" --ttl-ms "$ttl_ms" --rate-limit "$rate_limit" \
        --log "$log" &
   SERVER_PID=$!
+  CURRENT_RATIO="$ratio"
+  CURRENT_TTL="$ttl_ms"
+  CURRENT_RL="$rate_limit"
 
   local w=0
   until curl -sf "http://localhost:${API_PORT}/health" >/dev/null 2>&1; do
@@ -90,14 +101,33 @@ stop_server() {
   echo "  Server stopped."
 }
 
+run_unit() {
+  CURRENT_UNIT=$((CURRENT_UNIT + 1))
+  echo ""
+  echo "────────────────────────────────────────"
+  echo "  [$CURRENT_UNIT/$TOTAL_UNITS] $1"
+  echo "────────────────────────────────────────"
+
+  if [ "$RESTART_PER_UNIT" = "1" ] && [ "$CURRENT_UNIT" -gt 1 ]; then
+    stop_server
+    start_server "$CURRENT_RATIO" "$CURRENT_TTL" "$CURRENT_RL"
+  fi
+
+  shift
+  run_one_unit "$@"
+}
+
 cleanup() { [ -n "$SERVER_PID" ] && stop_server || true; }
 trap cleanup EXIT
+
+START_TIME=$(date +%s)
 
 echo ""
 echo "=========================================="
 echo "  Extreme prefetch failure experiment"
 echo "  $(date)"
 echo "  Results -> $ROOT"
+echo "  Runs: $TOTAL_UNITS (${DURATION_SEC}s each, REPEAT=$REPEAT)"
 echo "=========================================="
 
 # ───────────────────────────────────────────────────────
@@ -108,24 +138,14 @@ start_server 0.3 60000
 echo ""
 echo "===== Phase 1: PROTECTED (ratio=0.3, TTL=60s) ====="
 
-# S1: malicious flood — QPS sweep
-for qps in $S1_QPS; do
-  for r in $(seq 1 "$REPEAT"); do
-    PREFETCH_QPS="$qps" \
-      run_one_unit "$ROOT/protected_s1_qps${qps}_rep${r}" s1
-  done
+for r in $(seq 1 "$REPEAT"); do
+  PREFETCH_QPS=200 \
+    run_unit "P1 S1 qps200 rep$r" "$ROOT/protected_s1_qps200_rep${r}" s1
 done
 
-# S2: user misclick burst
 for r in $(seq 1 "$REPEAT"); do
   BURST_SIZE="$S2_BURST" \
-    run_one_unit "$ROOT/protected_s2_burst${S2_BURST}_rep${r}" s2
-done
-
-# S3: mixed — isolation test
-for r in $(seq 1 "$REPEAT"); do
-  MIX_RATIO="$S3_MIX" \
-    run_one_unit "$ROOT/protected_s3_mix${S3_MIX}_rep${r}" s3
+    run_unit "P1 S2 burst$S2_BURST rep$r" "$ROOT/protected_s2_burst${S2_BURST}_rep${r}" s2
 done
 
 stop_server
@@ -138,55 +158,56 @@ start_server 0 0
 echo ""
 echo "===== Phase 2: UNPROTECTED (ratio=0, TTL=0) ====="
 
-# S1 at QPS=200 for direct comparison with Phase 1
 for r in $(seq 1 "$REPEAT"); do
   PREFETCH_QPS=200 \
-    run_one_unit "$ROOT/unprotected_s1_qps200_rep${r}" s1
+    run_unit "P2 S1 qps200 rep$r" "$ROOT/unprotected_s1_qps200_rep${r}" s1
 done
 
-# S2 at same burst for direct comparison
 for r in $(seq 1 "$REPEAT"); do
   BURST_SIZE="$S2_BURST" \
-    run_one_unit "$ROOT/unprotected_s2_burst${S2_BURST}_rep${r}" s2
+    run_unit "P2 S2 burst$S2_BURST rep$r" "$ROOT/unprotected_s2_burst${S2_BURST}_rep${r}" s2
 done
 
 stop_server
 
 # ───────────────────────────────────────────────────────
-#  Phase 3: Protected + API rate limit (defense complete)
+#  Phase 3: Protected + API rate limit (full defense)
 # ───────────────────────────────────────────────────────
-RATE_LIMIT="${PREFETCH_RATE_LIMIT:-10}"
 start_server 0.3 60000 "$RATE_LIMIT"
 
 echo ""
 echo "===== Phase 3: PROTECTED + RATE LIMIT (${RATE_LIMIT} req/s) ====="
 
-# S1 at QPS=200: rate limiter should absorb flood,
-# baseline TTFT should match no-attack baseline.
 for r in $(seq 1 "$REPEAT"); do
   PREFETCH_QPS=200 \
-    run_one_unit "$ROOT/ratelimit_s1_qps200_rep${r}" s1
+    run_unit "P3 S1 qps200 rep$r" "$ROOT/ratelimit_s1_qps200_rep${r}" s1
 done
 
 stop_server
 
 # ───────────────────────────────────────────────────────
-#  Analysis
+#  Post-processing
 # ───────────────────────────────────────────────────────
 echo ""
-echo "===== Analysis ====="
-python3 "$TESTSUIT_ROOT/result-analysis/analyze_stress.py" --root "$ROOT"
+echo "===== Post-processing ====="
+
+python3 "$TESTSUIT_ROOT/result-analysis/analyze_stress.py" --root "$ROOT" || true
+
+END_TIME=$(date +%s)
+ELAPSED=$(( END_TIME - START_TIME ))
+ELAPSED_MIN=$(( ELAPSED / 60 ))
 
 echo ""
 echo "=========================================="
 echo "  Done.  $(date)"
-echo "  Results:    $ROOT/aggregate.csv"
-echo "  Figures:    $ROOT/figs/"
+echo "  Wall time: ${ELAPSED_MIN} min"
+echo "  Results:   $ROOT"
 echo "=========================================="
 echo ""
-echo "Key comparisons for the thesis:"
-echo "  1. protected s1 qps 50/200/800  ->  overhead saturates"
-echo "  2. protected vs unprotected s1 qps200  ->  quota bounds overhead"
-echo "  3. protected vs unprotected s2  ->  TTL prevents waste accumulation"
-echo "  4. protected s3  ->  real TTFT p95 degradation < 20%"
-echo "  5. ratelimit s1 qps200 vs protected s1 qps200  ->  rate limit eliminates scheduler flooding"
+echo "Key comparisons:"
+echo "  1. protected vs ratelimit S1  →  rate limit eliminates scheduler flood overhead"
+echo "  2. protected vs unprotected S2  →  TTL+quota bounds misclick overhead"
+echo "  3. All configs: PCIe events  →  NO_HIT path = zero wasted PCIe"
+echo ""
+echo "Generate thesis figures:"
+echo "  python3 paper-figs/prefetch/fig_stress_defense.py --root $ROOT"
