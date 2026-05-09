@@ -52,6 +52,19 @@ COMMON_WORDS = [
     "when", "make", "can", "like", "time", "no", "just", "him", "know", "take",
 ]
 
+COMPAT_COMMON_WORDS = [
+    "the", "be", "to", "of", "and", "a", "in", "that", "have", "I",
+    "it", "for", "not", "on", "with", "he", "as", "you", "do", "at",
+    "this", "but", "his", "by", "from", "they", "we", "say", "her", "she",
+    "or", "an", "will", "my", "one", "all", "would", "there", "their", "what",
+    "so", "up", "out", "if", "about", "who", "get", "which", "go", "me",
+    "when", "make", "can", "like", "time", "no", "just", "him", "know", "take",
+    "people", "into", "year", "your", "good", "some", "could", "them", "see", "other",
+    "than", "then", "now", "look", "only", "come", "its", "over", "think", "also",
+    "back", "after", "use", "two", "how", "our", "work", "first", "well", "way",
+    "even", "new", "want", "because", "any", "these", "give", "day", "most", "us",
+]
+
 
 PREFETCH_METRIC_NAMES = (
     "vllm:prefetch_gpu_hits_total",
@@ -84,6 +97,58 @@ def _gen_text(word_list: list[str], target_tokens: int, tokenizer) -> str:
         text = " ".join(word_list[start:end])
         cur = len(tokenizer.encode(text))
     return text
+
+
+def _build_compat_word_list(seed: int) -> list[str]:
+    """Build word list identical to prefetch_ab_runner's global-RNG approach."""
+    state = random.getstate()
+    random.seed(seed)
+    wl = [random.choice(COMPAT_COMMON_WORDS) for _ in range(WORD_POOL_SIZE)]
+    random.setstate(state)
+    return wl
+
+
+def _gen_text_compat(
+    compat_word_list: list[str],
+    target_tokens: int,
+    tokenizer,
+    chat_id: int,
+    turn: int,
+    seed: int,
+    placeholder: bool = False,
+) -> str:
+    """Generate text identical to prefetch_ab_runner._generate_text_with_tokens."""
+    if target_tokens <= 0:
+        return ""
+    sub_seed = seed + chat_id * 1000 + turn + (500000 if placeholder else 0)
+    state = random.getstate()
+    random.seed(sub_seed)
+    try:
+        estimated_words = min(int(target_tokens * 1.5), WORD_POOL_SIZE)
+        start_idx = random.randint(0, max(0, WORD_POOL_SIZE - estimated_words))
+        if start_idx + estimated_words <= WORD_POOL_SIZE:
+            text = " ".join(compat_word_list[start_idx : start_idx + estimated_words])
+        else:
+            first = compat_word_list[start_idx:]
+            remaining = estimated_words - len(first)
+            second = compat_word_list[:remaining]
+            text = " ".join(first + second)
+        if tokenizer is None:
+            return text
+        cur = len(tokenizer.encode(text))
+        while cur < target_tokens and estimated_words < WORD_POOL_SIZE:
+            estimated_words += 10
+            if start_idx + estimated_words <= WORD_POOL_SIZE:
+                text = " ".join(compat_word_list[start_idx : start_idx + estimated_words])
+            else:
+                first = compat_word_list[start_idx:]
+                remaining = min(estimated_words - len(first), WORD_POOL_SIZE)
+                second = compat_word_list[:remaining]
+                text = " ".join(first + second)
+            cur = len(tokenizer.encode(text))
+        return text
+    finally:
+        random.setstate(state)
 
 
 def _load_trace(path: str, max_records: int | None = None) -> list[dict]:
@@ -492,7 +557,7 @@ async def run_s1(args, runner: StressRunner, prefix_pool: list[list[dict]]):
         await asyncio.gather(*pending, return_exceptions=True)
 
 
-async def run_s2(args, runner: StressRunner, chains: list[list[dict]]):
+async def run_s2(args, runner: StressRunner, chains: list[list[dict]], compat_word_list: list[str] | None = None):
     """S2 = user mis-click burst.
 
     Each "user" walks a real-trace chain. At any turn that has prior history
@@ -550,8 +615,22 @@ async def run_s2(args, runner: StressRunner, chains: list[list[dict]]):
                 # always abandon (matches reviewer's "未提交请求").
                 if random.random() < abandon_prob:
                     return
-            user_tokens = max(10, record["input_length"] - args.input_token_budget)
-            user_msg = _gen_text(runner.word_list, user_tokens, runner.tokenizer)
+            if compat_word_list is not None:
+                history_tokens = (
+                    len(runner.tokenizer.encode(
+                        "\n".join(f"{m['role']}: {m['content']}" for m in history)
+                    ))
+                    if history and runner.tokenizer is not None
+                    else 0
+                )
+                new_user_tokens = max(10, record["input_length"] - history_tokens)
+                user_msg = _gen_text_compat(
+                    compat_word_list, new_user_tokens, runner.tokenizer,
+                    chat_id, turn, args.seed,
+                )
+            else:
+                user_tokens = max(10, record["input_length"] - args.input_token_budget)
+                user_msg = _gen_text(runner.word_list, user_tokens, runner.tokenizer)
             history.append({"role": "user", "content": user_msg})
             output_tokens = min(record.get("output_length", 64), args.max_output_tokens)
             text = await runner.send_real(
@@ -561,7 +640,13 @@ async def run_s2(args, runner: StressRunner, chains: list[list[dict]]):
                 chat_id=chat_id,
                 turn=turn,
             )
-            if text:
+            if compat_word_list is not None:
+                placeholder = _gen_text_compat(
+                    compat_word_list, record.get("output_length", 64),
+                    runner.tokenizer, chat_id, turn, args.seed, placeholder=True,
+                )
+                history.append({"role": "assistant", "content": placeholder})
+            elif text:
                 history.append({"role": "assistant", "content": text})
             else:
                 history.append(
@@ -589,7 +674,7 @@ async def run_s2(args, runner: StressRunner, chains: list[list[dict]]):
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def run_s3(args, runner: StressRunner, chains, prefix_pool):
+async def run_s3(args, runner: StressRunner, chains, prefix_pool, compat_word_list=None):
     """S3 = S1 attack + parallel benign trace.
 
     The mix-ratio controls attack QPS relative to benign QPS:
@@ -602,7 +687,7 @@ async def run_s3(args, runner: StressRunner, chains, prefix_pool):
     bg_args.burst_size = 1  # no bursting in benign workload
     await asyncio.gather(
         run_s1(attack_args, runner, prefix_pool),
-        run_s2(bg_args, runner, chains),
+        run_s2(bg_args, runner, chains, compat_word_list),
         return_exceptions=True,
     )
 
@@ -683,6 +768,7 @@ async def main_async(args: argparse.Namespace) -> None:
             )
 
     chains: list[list[dict]] = []
+    compat_word_list: list[str] | None = None
     if args.scenario in ("s2", "s3"):
         records = _load_trace(args.bg_trace_file, args.max_chains_records)
         chains = _build_chains(records)
@@ -690,6 +776,7 @@ async def main_async(args: argparse.Namespace) -> None:
             raise SystemExit(
                 f"No multi-turn chains in bg-trace-file {args.bg_trace_file}"
             )
+        compat_word_list = _build_compat_word_list(args.seed)
 
     Path(args.output_jsonl).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output_summary).parent.mkdir(parents=True, exist_ok=True)
@@ -714,9 +801,9 @@ async def main_async(args: argparse.Namespace) -> None:
         if args.scenario == "s1":
             await run_s1(args, runner, prefix_pool)
         elif args.scenario == "s2":
-            await run_s2(args, runner, chains)
+            await run_s2(args, runner, chains, compat_word_list)
         elif args.scenario == "s3":
-            await run_s3(args, runner, chains, prefix_pool)
+            await run_s3(args, runner, chains, prefix_pool, compat_word_list)
     t_end = time.time()
     await scraper.stop()
 
