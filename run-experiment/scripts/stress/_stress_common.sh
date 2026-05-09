@@ -86,9 +86,16 @@ run_one_unit() {
   # engine flushes events to <profiler_dir>/pcie_events_<rank>.json.
   curl -s -X POST "http://localhost:${API_PORT}/start_profile" >/dev/null || true
 
+  # Read the GPU IDs the stress server acquired (written by
+  # start_vllm_stress.sh) so power sampling stays scoped to our cards.
+  local stress_gpu_ids=""
+  if [ -f "$RUN_EXP_DIR/.stress_gpus" ]; then
+    stress_gpu_ids=$(cat "$RUN_EXP_DIR/.stress_gpus" 2>/dev/null || true)
+  fi
+
   # Background samplers.
   bash "$UTILS_DIR/sample_power.sh" \
-        "$results_dir/power.csv" "$duration" &
+        "$results_dir/power.csv" "$duration" "$stress_gpu_ids" &
   local power_pid=$!
   bash "$UTILS_DIR/sample_perf.sh" \
         "$results_dir/perf_pkg.txt" "$duration" &
@@ -116,23 +123,57 @@ run_one_unit() {
       ;;
   esac
 
-  # Run the runner. Any failure is logged but doesn't abort the unit so
-  # the samplers still get cleaned up; we surface the exit code via a
-  # marker file the caller (and analyze_stress.py) can inspect.
+  # === Baseline workload ============================================
+  # Launch the user's existing prefetch_ab_runner as a background load.
+  # This is the baseline experiment from chapter 3; it sends real
+  # multi-turn requests with prefetches, naturally populating the GPU
+  # prefix cache and CPU offload cache. The stress overlay below then
+  # lands on top of a realistic cache state, so attack/burst prefetches
+  # actually exercise the CPU_HIT path (and thereby admission control,
+  # quota and TTL reclaim) rather than discarding everything via NO_HIT.
+  echo "    launching baseline (prefetch_ab_runner) at qps=${BASELINE_QPS:-1.0}, conv=${BASELINE_NUM_CONV:-40}"
+  python3 "$RUN_EXP_DIR/prefetch_ab_runner.py" \
+      --trace-file "$DEFAULT_BG_TRACE" \
+      --mode prefetch \
+      --qps "${BASELINE_QPS:-1.0}" \
+      --num-multi-turn "${BASELINE_NUM_CONV:-40}" \
+      --model "$MODEL" \
+      --api-base "$API_BASE" \
+      --output "$results_dir/baseline.jsonl" \
+      --timeout "$duration" \
+      --schedule-mode "${SCHEDULE_MODE:-scaled-timestamp}" \
+      &> "$results_dir/baseline.log" &
+  local baseline_pid=$!
+
+  # Let baseline get a head start so the cache has content before the
+  # attack hits. Default 15s is enough to schedule a few turns through
+  # real inference and start spilling KV to CPU offload.
+  local head_start="${BASELINE_HEAD_START:-15}"
+  echo "    baseline head start: ${head_start}s"
+  sleep "$head_start"
+
+  # === Stress overlay ===============================================
+  # Run the attack/burst runner for the remaining duration.
+  local overlay_dur=$(( duration - head_start ))
+  if [ "$overlay_dur" -lt 30 ]; then overlay_dur=30; fi
+  echo "    launching $scenario overlay for ${overlay_dur}s"
   local rc=0
   python3 "$RUN_EXP_DIR/prefetch_stress_runner.py" \
       --scenario "$scenario" \
       --api-base "$API_BASE" \
       --model "$MODEL" \
-      --duration-sec "$duration" \
+      --duration-sec "$overlay_dur" \
       --output-jsonl "$results_dir/requests.jsonl" \
       --output-summary "$results_dir/summary.json" \
       "${extra_args[@]}" \
       &> "$results_dir/runner.log" || rc=$?
   echo "$rc" > "$results_dir/runner.exit_code"
   if [ "$rc" -ne 0 ]; then
-    echo "    WARN: runner exited with code $rc; see $results_dir/runner.log" >&2
+    echo "    WARN: overlay runner exited with code $rc; see $results_dir/runner.log" >&2
   fi
+
+  # Wait for baseline to finish (it has its own --timeout matching duration).
+  wait "$baseline_pid" 2>/dev/null || true
 
   # Stop samplers.
   kill -TERM "$power_pid" 2>/dev/null || true
@@ -147,11 +188,11 @@ run_one_unit() {
        "${PCIE_PROFILER_DIR:-$RUN_EXP_DIR/profiler_output}" || true
 
   # Quick post-hoc sanity check of artefacts.
-  for required in summary.json requests.jsonl power.csv pcie_events.json; do
+  for required in summary.json requests.jsonl baseline.jsonl power.csv pcie_events.json; do
     if [ ! -s "$results_dir/$required" ]; then
       echo "    WARN: $results_dir/$required is empty or missing" >&2
     fi
   done
-  echo "    summary written to $results_dir/summary.json"
+  echo "    artefacts: summary.json (overlay) | baseline.jsonl (real load) | pcie_events.json | power.csv"
   sleep 30
 }

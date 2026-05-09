@@ -85,7 +85,13 @@ if ! wait_for_free_gpus "$NUM_GPUS" "${GPU_WAIT_TIMEOUT:-0}"; then
   exit 1
 fi
 FREE_GPUS="$ACQUIRED_GPUS"
-trap 'release_gpus' EXIT INT TERM
+
+# Publish acquired GPU indices so sibling stress scripts (sample_power.sh
+# in particular) can scope their measurements to just our cards instead
+# of the whole node.
+GPU_MARKER="$RUN_EXP_DIR/.stress_gpus"
+echo "$FREE_GPUS" > "$GPU_MARKER"
+trap 'release_gpus; rm -f "$GPU_MARKER"' EXIT INT TERM
 
 echo "============================================"
 echo "vLLM stress server"
