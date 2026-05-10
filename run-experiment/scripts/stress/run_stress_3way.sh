@@ -163,7 +163,7 @@ run_baseline_s1() {
   echo "    launching vanilla baseline at qps=$BG_QPS, conv=$BG_CONV"
   python3 "$RUN_EXP_DIR/prefetch_ab_runner.py" \
       --trace-file "$DEFAULT_BG_TRACE" \
-      --mode vanilla \
+      --mode baseline \
       --qps "$BG_QPS" \
       --num-multi-turn "$BG_CONV" \
       --model "$MODEL" \
@@ -249,7 +249,7 @@ run_baseline_s2() {
   echo "    launching vanilla workload at qps=$BG_QPS, conv=$BG_CONV"
   python3 "$RUN_EXP_DIR/prefetch_ab_runner.py" \
       --trace-file "$DEFAULT_BG_TRACE" \
-      --mode vanilla \
+      --mode baseline \
       --qps "$BG_QPS" \
       --num-multi-turn "$BG_CONV" \
       --model "$MODEL" \
