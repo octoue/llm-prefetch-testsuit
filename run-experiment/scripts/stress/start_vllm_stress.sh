@@ -35,6 +35,8 @@
 #   STRESS_BLOCK_RATIO           --max-prefetch-block-ratio (default 0.3)
 #   STRESS_PREFETCH_TTL_MS       --prefetch-ttl-ms          (default 60000)
 #   STRESS_PREFETCH_RATE_LIMIT   API-layer prefetch rate limit req/s (default 0=off)
+#   STRESS_MAX_MODEL_LEN         --max-model-len (default 32768; Qwen3-32B needs
+#                                  this to fit KV cache in 0.7 gpu_memory_utilization)
 #   GPU_WAIT_TIMEOUT             seconds to wait for free GPUs (0 = forever)
 
 set -e
@@ -56,6 +58,7 @@ PP="${STRESS_PP:-${VLLM_PIPELINE_PARALLEL_SIZE:-2}}"
 RATIO="${STRESS_BLOCK_RATIO:-0.3}"
 TTL_MS="${STRESS_PREFETCH_TTL_MS:-60000}"
 PREFETCH_RATE_LIMIT="${STRESS_PREFETCH_RATE_LIMIT:-0}"
+MAX_MODEL_LEN="${STRESS_MAX_MODEL_LEN:-32768}"
 PORT="${API_PORT:-8000}"
 LOG_FILE="${RUN_EXP_DIR}/results/stress/vllm_stress.log"
 
@@ -66,6 +69,7 @@ while [[ $# -gt 0 ]]; do
     --ratio) RATIO="$2"; shift 2 ;;
     --ttl-ms) TTL_MS="$2"; shift 2 ;;
     --rate-limit) PREFETCH_RATE_LIMIT="$2"; shift 2 ;;
+    --max-model-len) MAX_MODEL_LEN="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
     --log) LOG_FILE="$2"; shift 2 ;;
     *) shift ;;
@@ -102,6 +106,7 @@ echo "  model     = $MODEL"
 echo "  GPUs      = $FREE_GPUS  (tp=$TP, pp=$PP, total=$NUM_GPUS)"
 echo "  port      = $PORT"
 echo "  ratio     = $RATIO"
+echo "  max_model_len = $MAX_MODEL_LEN"
 echo "  ttl_ms    = $TTL_MS"
 echo "  rate_limit= $PREFETCH_RATE_LIMIT req/s"
 echo "  GPU_MEMORY_UTILIZATION=$GPU_MEMORY_UTILIZATION"
@@ -120,6 +125,7 @@ CMD_ARGS=(
   --tensor-parallel-size "$TP"
   --pipeline-parallel-size "$PP"
   --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
+  --max-model-len "$MAX_MODEL_LEN"
   --max-num-seqs "$VLLM_MAX_NUM_SEQS"
   --block-size "$VLLM_BLOCK_SIZE"
   --enable-prefix-caching
