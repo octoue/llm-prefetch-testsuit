@@ -58,6 +58,8 @@ PP="${STRESS_PP:-${VLLM_PIPELINE_PARALLEL_SIZE:-2}}"
 RATIO="${STRESS_BLOCK_RATIO:-0.3}"
 TTL_MS="${STRESS_PREFETCH_TTL_MS:-60000}"
 PREFETCH_RATE_LIMIT="${STRESS_PREFETCH_RATE_LIMIT:-0}"
+COALESCE_MS="${STRESS_PREFETCH_COALESCE_MS:-0}"
+PREFETCH_COALESCE_MS="${STRESS_PREFETCH_COALESCE_MS:-0}"
 MAX_MODEL_LEN="${STRESS_MAX_MODEL_LEN:-32768}"
 PORT="${API_PORT:-8000}"
 LOG_FILE="${RUN_EXP_DIR}/results/stress/vllm_stress.log"
@@ -69,6 +71,7 @@ while [[ $# -gt 0 ]]; do
     --ratio) RATIO="$2"; shift 2 ;;
     --ttl-ms) TTL_MS="$2"; shift 2 ;;
     --rate-limit) PREFETCH_RATE_LIMIT="$2"; shift 2 ;;
+    --coalesce-ms) PREFETCH_COALESCE_MS="$2"; shift 2 ;;
     --max-model-len) MAX_MODEL_LEN="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
     --log) LOG_FILE="$2"; shift 2 ;;
@@ -109,6 +112,8 @@ echo "  ratio     = $RATIO"
 echo "  max_model_len = $MAX_MODEL_LEN"
 echo "  ttl_ms    = $TTL_MS"
 echo "  rate_limit= $PREFETCH_RATE_LIMIT req/s"
+echo "  coalesce_ms= $COALESCE_MS"
+echo "  coalesce_ms= $PREFETCH_COALESCE_MS"
 echo "  GPU_MEMORY_UTILIZATION=$GPU_MEMORY_UTILIZATION"
 echo "  NUM_GPU_BLOCKS_OVERRIDE=$NUM_GPU_BLOCKS_OVERRIDE"
 echo "  KV_OFFLOADING_SIZE=${KV_OFFLOADING_SIZE}, SWAP_SPACE=${SWAP_SPACE}"
@@ -134,6 +139,8 @@ CMD_ARGS=(
   --disable-hybrid-kv-cache-manager
   --max-prefetch-block-ratio "$RATIO"
   --prefetch-ttl-ms "$TTL_MS"
+  --prefetch-coalesce-window-ms "$COALESCE_MS"
+  --prefetch-coalesce-window-ms "$PREFETCH_COALESCE_MS"
   --profiler-config "{\"profiler\":\"pcie\",\"torch_profiler_dir\":\"$PROFILER_DIR\"}"
 )
 
